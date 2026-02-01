@@ -14,6 +14,9 @@ precollection/outputs/
 precollection/logs/
 precollection/data/processed/
 precollection/data/raw/subtitles/
+# Nested run outputs (accidental path)
+precollection/precollection/runs/
+precollection/precollection/outputs/
 
 # Audio artifacts (if any)
 precollection/**/*.wav
