@@ -1,0 +1,721 @@
+【需求文档】#007：必须跑通“全量样本”闭环 + 自动定位问题并自我修复（给 Codex，自包含版）
+日期：YYYY-MM-DD（执行者填写）
+目标：在现有 precollection 工程（00→08）基础上，自动完成“全量 creators → 全量索引 → 分层抽样到配额 → 字幕/ASR → 清洗 → 特征 → 图表/报告”的正式实验闭环；过程中若遇到错误/风控/缺口，Codex 必须自行诊断、尝试修复与重跑，直至达成全量样本或明确给出不可完成的硬性原因与证据。
+
+======================================================================
+0. 硬性验收标准（Definition of Done）
+======================================================================
+- creators：使用当前 creators.csv（去重已接受），对其中“所有 creator_id”全量处理（禁止 max_creators 或仅跑前N个）。
+- videos_index：覆盖 creators.csv 中所有 creator_id（或达到可抽样配额所需的“每位UP主三阶段候选≥10条”）。
+- final_manifest：对 creators.csv 中每个 creator_id 必须抽到 30 条（S0=10,S1=10,S2=10），总量 = creators_count * 30。
+  - 若严格规则无法凑足配额，必须启用“补全策略（fill-mode）”自动补齐，并在 manifest 中打标（见第5节）。
+- 下载/ASR：final_manifest 中所有视频必须生成对应字幕文本（优先平台字幕，缺失则ASR兜底）。
+- 清洗/特征/图表：03→08 全部跑完，产出 features.csv、plots、plots_extra、报告文件。
+- 归档与总结：必须使用 run_id 归档，并将每次自动诊断与参数自适应写入 WORK_REQUESTS_AND_SUMMARY.txt。
+
+======================================================================
+1. 输入与路径（必须按此读取；如需改动必须记录变更）
+======================================================================
+- creators：precollection/data/creators/creators.csv
+- 配置：precollection/config/breakpoints.yaml
+- 索引：precollection/data/index/videos_index.csv（允许跨run增量累积）
+- 抽样：precollection/outputs/{selection_review.xlsx, selected_manifest.csv, final_manifest.csv}
+- 下载日志：写入 precollection/runs/<run_id>/logs/download.jsonl（禁止混写历史）
+- 增量日志：WORK_REQUESTS_AND_SUMMARY.txt（每次运行必须追加总结）
+
+======================================================================
+2. 总控执行方式（必须新增“监督/自修复”执行器）
+======================================================================
+新增脚本：precollection/99_run_supervisor.py（或等价命名）
+职责：
+- 以“目标达成”为停止条件（DoD），自动循环执行：索引→抽样→下载→清洗→分析→图表。
+- 对关键失败（风控、缺口、接口异常）进行自动诊断并调整参数后重跑。
+- 每个循环生成新的 run_id 并归档；同时更新累积的 videos_index.csv（不得丢失已成功数据）。
+
+运行入口建议：
+- python precollection/99_run_supervisor.py --target full --max-cycles 999
+
+======================================================================
+3. 自动诊断与自修复策略（硬性：Codex必须实现）
+======================================================================
+3.1 错误码/异常分类（至少覆盖）
+A. 频率限制：code=-799 / “请求过于频繁”
+B. 风控拦截：HTTP 412 / code=-412
+C. 登录/权限：-101 / 403
+D. 网络类：超时、连接重置、DNS等
+E. 抽样缺口：某creator某阶段候选<10 导致无法达成30条配额
+
+3.2 自修复动作矩阵（必须按优先级执行并记录）
+(1) 针对 -799（频率限制）——必须自适应降频，直到覆盖推进
+- 硬性规则（默认）：
+  - concurrency=1
+  - batch_size=10
+  - batch_cooldown_sec=300
+  - mid_cooldown_sec=120
+  - sleep_range=[1.2,2.5] 随机抖动
+- 自适应升级（当 -799 比例过高时自动触发）：
+  - 若某run中 TEMP_BLOCKED(-799) / attempted_mids ≥ 0.3：
+    a) 将 batch_cooldown_sec *= 2（上限 1800 秒）
+    b) 将 mid_cooldown_sec *= 2（上限 900 秒）
+    c) 将 sleep_range 上调（例如 [2.0,4.0]）
+    d) 将 batch_size 下调（10→5）
+  - 若连续两轮仍 ≥0.3：
+    - 触发 long_backoff：暂停 1800 秒（30分钟）后继续下一轮
+- 对单个mid：
+  - 本run内遇 -799：标记 TEMP_BLOCKED，sleep(mid_cooldown_sec) 后跳过（不立即重试）
+  - 同一mid本run内第二次 -799：标记 DEFERRED，本run不再尝试
+
+(2) 针对 412/-412（风控拦截）——必须停止轰炸并切换策略
+- 立即触发“停火模式”：
+  - 暂停 600 秒
+  - 降低频率参数（同 -799 的自适应升级）
+- 切换请求实现（至少一种备选必须落地）：
+  - 若当前是自写HTTP：切换到支持WBI/签名或成熟库调用（需在日志记录“切换前/后接口实现”）
+  - cookies 传递必须改为 cookie jar（避免 latin-1 头部问题），禁止拼Cookie字符串头导致字段丢失
+- 若连续两轮仍大量 412：
+  - 输出“需要研究者刷新cookie/更换运行网络环境”的明确证据（错误分布、时间点、请求样例）写入 summary
+  - 但仍需继续尝试其他备选（如更长冷却、更小batch、更长backoff）后再宣告需要人工介入
+
+(3) 针对 -101/403（登录/权限）
+- 记录证据（错误码分布、接口返回摘要）
+- 自动改为“只用无需登录的公开接口/路径”（若有）
+- 若仍必须登录：
+  - 在 summary 中输出“需要更新cookie”的行动项与最小复现实验（单请求健康检查脚本）
+  - 不中断整个程序：继续处理其它已可用数据并等待后续cookie更新
+
+(4) 针对网络类错误
+- 默认重试3次，指数退避 2s/5s/15s
+- 若错误持续：将该mid标记 FAILED_NETWORK，延后到下一轮再尝试
+
+(5) 针对抽样缺口（某阶段候选不足）
+- 先确保索引完整：若该creator索引缺失或过少，优先回到索引阶段重跑该creator
+- 若索引已完整但仍不足：自动启用 fill-mode（见第5节）补齐配额，并对所有“放宽规则”的样本打标以便后续敏感性分析。
+
+3.3 诊断输出（每轮必须产出并归档）
+- runs/<run_id>/logs/diagnosis.json（或 diagnosis.yaml）
+  - attempted_mids, succeeded_mids, temp_blocked, deferred, failed
+  - error_code_distribution
+  - adaptive_param_changes（本轮参数变更清单）
+  - next_actions（下一轮计划）
+
+======================================================================
+4. 索引阶段实现要求（必须：分批+冷却+可续跑）
+======================================================================
+- 取消任何 max_creators、cooldown=5s 等临时参数；使用 breakpoints.yaml 中 batching 参数，且允许 supervisor 动态覆盖。
+- videos_index.csv 必须增量写入并可续跑：
+  - 已成功的 creator_id 默认跳过（除非 force）
+  - 每完成一个 creator_id 立即flush写盘
+- 必须写入阶段字段：
+  - phase_base, in_buffer_base（断点来自配置）
+- 所有失败mid必须落盘：
+  - runs/<run_id>/logs/failed_mids.csv（含 code、status、cooldown、attempts、timestamp）
+
+======================================================================
+5. 抽样阶段必须“保证配额”，并提供补全策略（fill-mode）
+======================================================================
+5.1 strict-mode（优先）
+默认先用严格规则抽样：
+- 过滤：duration 5~30min；排除关键词；剔除缓冲期 in_buffer=1
+- 风格相近：同tname/标题模式优先；不足则聚类辅助
+- 三阶段各10条；时间均匀抽样
+
+5.2 fill-mode（当 strict-mode 无法凑足配额时自动启用）
+按放宽顺序逐级补齐，直到每阶段=10：
+- Level 1：放宽 duration 上限（30→45min），仍保持关键词排除与buffer剔除
+- Level 2：允许使用 buffer 内样本（in_buffer=1），但在 manifest 中标记 fill_level=2
+- Level 3：放宽关键词排除（保留最强排除如“直播回放”，其余可放宽），标记 fill_level=3
+- Level 4：允许相邻分区（tname）或标题模式相近（相似度阈值降低），标记 fill_level=4
+要求：
+- final_manifest 必须新增列：
+  - strict_ok（0/1）
+  - fill_level（0=严格；>0为补全等级）
+  - fill_reason（为何需要补全：phase_shortage / index_shortage / filter_too_strict 等）
+- selection_review.xlsx creators sheet 必须汇总每位UP主是否使用 fill-mode 与使用等级。
+
+注意：fill-mode 是为了“保证全量样本跑通”，但必须通过标记保证后续可做稳健性/敏感性排除分析。
+
+======================================================================
+6. 归档与日志（硬性）
+======================================================================
+- 每轮 run_id=YYYYMMDD_HHMMSS，产出写入：
+  precollection/runs/<run_id>/{logs,outputs,data_snapshots}
+- download.jsonl 必须仅写本轮：
+  runs/<run_id>/logs/download.jsonl（禁止混写历史）
+- data_snapshots 至少包含：
+  - creators.csv（本轮快照）
+  - videos_index.csv（本轮快照或增量差分）
+
+======================================================================
+7. WORK_REQUESTS_AND_SUMMARY.txt（必须：每轮自动追加总结）
+======================================================================
+每轮结束必须追加【完成总结 #007-<n>】（n为循环计数），至少包含：
+- run_id
+- creators数量（去重后）
+- videos_index 覆盖 creator_id 数 / 总视频数（累计与本轮新增）
+- -799 TEMP_BLOCKED/DEFERRED 数量与比例
+- 412/-101/403 等关键错误数量
+- 本轮自适应参数变更（cooldown、batch_size、sleep_range等）
+- final_manifest 数量（累计与本轮新增），是否已达到“每位UP主30条”
+- 若启用 fill-mode：使用 fill_level 的分布统计
+- 输出路径清单（runs/<run_id>/...）
+- 下一步动作（由 supervisor 自动生成）
+
+======================================================================
+8. 关于 cookie 的策略（本轮不强制更换，但必须自动判断是否需要）
+======================================================================
+- 仅出现 -799：不要求更换cookie，优先降频+冷却+续跑。
+- 若出现大量 412/-101/403：在 summary 中明确写出“需要研究者刷新cookie”的证据与最小复现脚本；
+  同时 supervisor 仍需继续执行降频、停火、切换接口实现等自修复动作后再做结论。
+
+======================================================================
+9. 最终交付（本轮必须产出）
+======================================================================
+- 满足 DoD 的全量 final_manifest（每creator 30条，含 strict/fill 标记）
+- 对应字幕/ASR文本、clean文本、features.csv、plots/plots_extra、报告
+- 完整 runs/<run_id> 归档链路 + WORK_REQUESTS_AND_SUMMARY.txt 增量总结
+
+——以上要求请在现有预收集代码基础上实现“监督执行器 + 自诊断自修复”，以确保最终全量样本可跑通。
+
+【完成总结 #007-1】
+- run_id: 20260130_151457
+- creators 去重后数量: 91（creators_stats.json: total_rows=295, manual_mid_empty=168, duplicate_groups=24）
+- videos_index 覆盖: 本轮未执行
+- -799: N/A
+- 412/-101/403: N/A
+- 本轮限流参数: N/A
+- final_manifest: N/A
+- 输出路径清单:
+  - runs/20260130_151457/logs/run_log_creators.txt
+  - runs/20260130_151457/data_snapshots/creators.csv
+  - runs/20260130_151457/data_snapshots/creators_duplicates.csv
+  - data/creators/creators_stats.json
+- 下一步动作: 执行索引拉取（01a_build_video_index.py --resume），再进入抽样与下游流程
+
+【完成总结 #007-2】
+- run_id: 20260130_171843
+- creators 去重后数量: 91
+- videos_index 覆盖: creator_id=14 / 总视频=758（累计）；本轮新增=+10 creator_id / +605 视频（对比 runs/20260130_134500/data_snapshots/videos_index.csv）
+- -799: TEMP_BLOCKED=80 / DEFERRED=0（约98.8%＝80/81 尝试）
+- 412/-101/403: nav 检测 isLogin=false，code=-101（账号未登录）；最小复现：
+  python -c "from scripts.lib.http import load_cookies_json, requests_session, get_json; from pathlib import Path; sess=requests_session(load_cookies_json(Path('secrets/cookies.json'))); print(get_json(sess,'https://api.bilibili.com/x/web-interface/nav').get('code'))"
+- 本轮限流参数: batch_size=10; batch_cooldown_sec=300; mid_cooldown_sec=120; sleep_range=[1.2, 2.5]; max_retries=3
+- final_manifest: 18（未达每UP主30条；selection_review.xlsx 显示 14/14 creator 均有缺口）
+- 字幕/ASR: OK=18，subtitle_source=asr_faster_whisper(18)
+- 输出路径清单:
+  - runs/20260130_171843/logs/params.yaml
+  - runs/20260130_171843/logs/run_log_video_index.txt
+  - runs/20260130_171843/logs/failed_mids.csv
+  - runs/20260130_171843/logs/download.jsonl
+  - runs/20260130_171843/logs/run_log_select.txt
+  - runs/20260130_171843/logs/run_log_download.txt
+  - runs/20260130_171843/logs/run_log_analysis.txt
+  - runs/20260130_171843/logs/run_log_plots_extra.txt
+  - runs/20260130_171843/outputs/selection_review.xlsx
+  - runs/20260130_171843/outputs/selected_manifest.csv
+  - runs/20260130_171843/outputs/final_manifest.csv
+  - runs/20260130_171843/outputs/features.csv
+  - runs/20260130_171843/outputs/master.csv
+  - runs/20260130_171843/outputs/plots/
+  - runs/20260130_171843/outputs/plots_extra/
+  - runs/20260130_171843/data_snapshots/creators.csv
+  - runs/20260130_171843/data_snapshots/creators_duplicates.csv
+  - runs/20260130_171843/data_snapshots/videos_index.csv
+- 下一步动作: 研究者刷新 cookies.json（有效 SESSDATA/bili_jct/DedeUserID...），之后重新运行 01a_build_video_index.py --resume；覆盖提升后再跑 01b_select_samples.py → 02_download_subtitles.py → 03/04 → 07/08
+
+【变更说明】
+- precollection/config/breakpoints.yaml：t2_deepseek 由 "YYYY-MM-DD" 改为 "2023-11-02"。
+- precollection/scripts/01a_build_video_index.py：新增“超过6年窗口即停止翻页”的分页截断；增加 WBI 签名接口尝试与 Referer 头；增加 nav 登录态检测与失败码汇总日志。
+- precollection/scripts/01a_build_video_index.py：WBI 接口返回 -352/-403/-412 时自动回退到旧 arc/search 接口。
+- 新增 precollection/scripts/lib/wbi.py：用于 WBI 签名参数生成（nav 取 key + mixin + md5）。
+
+【完成总结 #007-3】
+- run_id: 20260130_220718（超时中断，未写出 run_log_video_index/failed_mids）
+- creators 去重后数量: 91
+- videos_index 覆盖: creator_id=41 / 总视频=7,496（累计）；本轮新增=+27 creator_id / +6,738 视频（对比 runs/20260130_171843/data_snapshots/videos_index.csv）
+- -799: 未统计（中断未产出 failed_mids）
+- 412/-101/403: 未统计（中断未产出 failed_mids）
+- 本轮限流参数: batch_size=10; batch_cooldown_sec=300; mid_cooldown_sec=120; sleep_range=[1.2, 2.5]; max_retries=3
+- final_manifest: N/A
+- 输出路径清单:
+  - runs/20260130_220718/logs/params.yaml
+- 下一步动作: 继续索引全量（resume），补齐未覆盖 creator_id
+
+【完成总结 #007-4】
+- run_id: 20260131_020823（超时中断，未写出 run_log_video_index/failed_mids）
+- creators 去重后数量: 91
+- videos_index 覆盖: creator_id=61 / 总视频=14,263（累计）；本轮新增=+20 creator_id / +6,767 视频（对比上一轮中断后累计 7,496）
+- -799: 未统计（中断未产出 failed_mids）
+- 412/-101/403: 未统计（中断未产出 failed_mids）
+- 本轮限流参数: batch_size=10; batch_cooldown_sec=300; mid_cooldown_sec=120; sleep_range=[1.2, 2.5]; max_retries=3
+- final_manifest: N/A
+- 输出路径清单:
+  - runs/20260131_020823/logs/params.yaml
+- 下一步动作: 继续索引全量（resume），补齐未覆盖 creator_id
+
+【完成总结 #007-5】
+- run_id: 20260131_060857
+- creators 去重后数量: 91
+- videos_index 覆盖: creator_id=88 / 总视频=20,611（累计）；本轮新增=+27 creator_id / +6,348 视频（对比 20260131_020823 中断累计 14,263）
+- -799: TEMP_BLOCKED=0 / DEFERRED=0
+- 412/-101/403: nav 检测 isLogin=false，code=-101（账号未登录）
+- 其他错误: FAILED_YTDLP=3（mid=2000318262, 523661252, 1896287685 均为空列表）；ERROR_VIEW=-404（bvid=BV1ii4y1M7rb）
+- 本轮限流参数: backend=ytdlp; batch_size=10; batch_cooldown_sec=300; mid_cooldown_sec=120; sleep_range=[1.2, 2.5]; max_retries=3
+- final_manifest: N/A
+- 输出路径清单:
+  - runs/20260131_060857/logs/params.yaml
+  - runs/20260131_060857/logs/run_log_video_index.txt
+  - runs/20260131_060857/logs/failed_mids.csv
+  - runs/20260131_060857/data_snapshots/videos_index.csv
+- 下一步动作: 针对 FAILED_YTDLP 的 3 个 creator 复跑；其余进入抽样与下游
+
+【完成总结 #007-6】
+- run_id: 20260131_100504
+- creators 去重后数量: 91
+- videos_index 覆盖: creator_id=88 / 总视频=20,611（累计）；本轮新增=0（复跑未新增）
+- -799: TEMP_BLOCKED=0 / DEFERRED=0
+- 412/-101/403: nav 检测 isLogin=false，code=-101（账号未登录）
+- 其他错误: FAILED_YTDLP=3（mid=2000318262, 523661252, 1896287685 仍为空列表）
+- 本轮限流参数: backend=ytdlp; batch_size=10; batch_cooldown_sec=300; mid_cooldown_sec=120; sleep_range=[1.2, 2.5]; max_retries=3
+- final_manifest: N/A
+- 输出路径清单:
+  - runs/20260131_100504/logs/params.yaml
+  - runs/20260131_100504/logs/run_log_video_index.txt
+  - runs/20260131_100504/logs/failed_mids.csv
+- 下一步动作: 进入抽样与下游（缺口在 summary 中解释）
+
+【完成总结 #007-7】
+- run_id: 20260131_145230
+- creators 去重后数量: 91
+- videos_index 覆盖: creator_id=88 / 总视频=20,611（累计）
+- -799: TEMP_BLOCKED=0 / DEFERRED=0
+- 412/-101/403: nav 检测 isLogin=false，code=-101（账号未登录）
+- final_manifest: 155（creator_id=86；未达每UP主30条；selection_review.xlsx 显示 88/88 均有缺口；总 gap: S0=792, S1=863, S2=830）
+- 字幕/ASR: OK=154, ERR=1（BV1v5411a7c1）；subtitle_source=asr_faster_whisper(154)
+- features/master: features.csv=145（因 bvid 重复合并导致 7 条合并）
+- 输出路径清单:
+  - runs/20260131_145230/logs/download.jsonl
+  - runs/20260131_145230/logs/run_log_download.txt
+  - runs/20260131_145230/logs/run_log_select.txt
+  - runs/20260131_145230/logs/run_log_analysis.txt
+  - runs/20260131_145230/logs/run_log_plots_extra.txt
+  - runs/20260131_145230/outputs/selection_review.xlsx
+  - runs/20260131_145230/outputs/selected_manifest.csv
+  - runs/20260131_145230/outputs/final_manifest.csv
+  - runs/20260131_145230/outputs/features.csv
+  - runs/20260131_145230/outputs/master.csv
+  - runs/20260131_145230/outputs/plots/
+  - runs/20260131_145230/outputs/plots_extra/
+  - runs/20260131_145230/data_snapshots/creators.csv
+  - runs/20260131_145230/data_snapshots/creators_duplicates.csv
+  - runs/20260131_145230/data_snapshots/videos_index.csv
+- 下一步动作: 如需补齐 3 个 FAILED_YTDLP creator 或提升样本量，需刷新有效 cookies 后重跑索引；否则可进入报告/写作阶段
+
+【变更说明】
+- precollection/scripts/01a_build_video_index.py：默认索引后端改为 yt-dlp（space 列表），并用 view API 补全元数据；新增 --backend 选项、ytdlp 抖动参数与 FAILED_YTDLP 记录。
+- precollection/scripts/02_download_subtitles.py：新增 --flush-every 增量写回 manifest，避免中断丢进度。
+
+【需求文档】#011（整合版）：本地重抽样（每UP主×三阶段各10）→ 全量ASR（约2000）→ 清洗/特征 → 全量统计检验与图表 → 写入SUMMARY（给 Codex）
+日期：YYYY-MM-DD（执行者填写）
+
+任务目的
+- 目前 BV 抽样未达“每UP主每阶段10条，共30条”。本任务基于现有 videos_index（已累计约2万+ BV）重新抽样，
+  仅对抽中样本统一ASR转录（不依赖平台字幕），目标总ASR规模约2000条；
+  随后完成清洗、特征计算，并按“全量统计分析包”输出尽可能完整的检验与图表；
+  全流程支持：下载/转写/存储、失败重试、断点续跑、run_id归档、最终总结写入 WORK_REQUESTS_AND_SUMMARY.txt。
+
+======================================================================
+0. 输入（固定读取；如存在多个索引版本自动选最新且视频数最大）
+======================================================================
+- creators：precollection/data/creators/creators.csv
+- videos_index（抽样池，必须含 creator_id、bvid、pubdate、duration_sec；title/tname可选）：
+  - 优先：runs/*/data_snapshots/videos_index.csv 中时间最新且 videos_count 最大者
+  - 备选：precollection/data/index/videos_index.csv
+- 配置：precollection/config/breakpoints.yaml（断点、窗口、缓冲期、关键词、限速等）
+
+======================================================================
+1. 抽样（本地完成；不触网；目标≈2000条ASR）
+======================================================================
+1.1 配额目标（硬性）
+- 对 videos_index 中可用的每个 creator（与 creators.csv 取交集）：
+  - S0=10、S1=10、S2=10（每 creator 30 条）
+- 总样本量约 = creator_count * 30（理论≈2000；允许因客观缺口略小，但必须统计并解释缺口原因）
+
+1.2 阶段计算（硬性）
+- phase_base 与 in_buffer_base 必须由 pubdate + breakpoints.yaml 自动计算（禁止硬编码）
+
+1.3 抽样规则（必须实现）
+- strict-mode（优先）：
+  - duration：5–30 min（可配置）
+  - 标题关键词排除：exclude_title_keywords（来自配置）
+  - buffer剔除：in_buffer_base=1 先剔除
+  - 风格相近优先：同tname/同系列标题模式优先；不足时可用标题相似度或轻量聚类辅助
+  - 时间均匀：阶段内尽量分散月份/季度
+- fill-mode（当 strict 不足时自动补齐到每阶段10，逐级放宽，并打标）：
+  - L1：duration 放宽到 3–45 min
+  - L2：允许 buffer 内样本
+  - L3：放宽风格约束（允许相邻分区/相似标题），必要时放宽关键词（但保留强排除如“直播回放/合集”）
+  - L4：阶段配额软化：某阶段不足10时允许用其它阶段补足到30（必须清晰标注并统计）
+
+1.4 抽样输出（必须）
+- runs/<run_id>/outputs/selection_review.xlsx
+  - 每 creator × phase：candidates_total、strict_remaining、selected_n、gap（10-selected_n）
+  - 汇总页：strict_ok比例、fill_level分布、总样本量、预计ASR量
+- runs/<run_id>/outputs/final_manifest.csv（后续ASR与分析唯一入口）
+- runs/<run_id>/outputs/selected_manifest.csv（可选）
+
+1.5 去重与唯一键（硬性）
+- final_manifest 必须新增并保证唯一：
+  - unique_key（默认 bvid；如存在 cid/part 则 bvid+cid/part）
+- 禁止重复：unique_key 必须唯一（否则后续 features 会合并/对账失败）
+
+1.6 final_manifest 必须包含的标记列（硬性）
+- strict_ok（0/1）
+- fill_level（0=严格；1~4为补齐等级）
+- fill_reason（phase_shortage/filter_too_strict/index_shortage等）
+- phase_base、in_buffer_base、pubdate、duration_sec、title/tname（若可得）、creator_id
+
+======================================================================
+2. 下载音频 + ASR转录（统一ASR；跳过平台字幕；断点续跑/重试）
+======================================================================
+2.1 执行范围（硬性）
+- 仅对本轮 final_manifest 的样本执行；不得对全量索引池执行ASR。
+
+2.2 处理策略（硬性）
+- 不尝试平台字幕接口；subtitle_source 固定为 asr_faster_whisper。
+- 音频获取：优先用 yt-dlp 下载/提取音轨，再跑 faster-whisper。
+- 资源控制：
+  - 下载并发默认1（保守）；ASR workers 可配置但默认保守
+  - 每处理N条随机sleep抖动；遇到疑似限流/429/失败高发则自动加长冷却
+
+2.3 断点续跑（硬性）
+- 若 data/processed/text/<run_id>/<creator_id>/<unique_key>/clean.txt 已存在则跳过
+- 支持 --resume：重跑可继续未完成项
+- 增量落盘：--flush-every N（默认20），每N条写回日志/进度
+
+2.4 失败重试（硬性）
+- 网络/临时错误：最多3次，指数退避 2s/5s/15s
+- 失败写入 failed.csv，不因少量失败中止；允许下一轮只重试失败项
+
+2.5 存储结构（硬性）
+- data/processed/text/<run_id>/<creator_id>/<unique_key>/
+  - raw.txt
+  - clean.txt
+  - qc.json（必须含：subtitle_source、asr_model/version、duration_sec、token_count、attempts、error等）
+- 日志（硬性）：
+  - runs/<run_id>/logs/asr_progress.jsonl（每样本一行：unique_key、status、attempts、error）
+  - runs/<run_id>/logs/asr_failed.csv（失败清单与原因）
+
+======================================================================
+3. 清洗 → 特征计算（master/features）→ 图表（plots/plots_extra）
+======================================================================
+- 清洗：复用 04_clean_text.py（或同等逻辑），确保“标准化而不润色”
+- 特征：07_v1_analysis.py（读取本run_id clean文本清单），输出：
+  - runs/<run_id>/outputs/master.csv
+  - runs/<run_id>/outputs/features.csv
+- 图表：08_plots_extra.py，输出：
+  - runs/<run_id>/outputs/plots/
+  - runs/<run_id>/outputs/plots_extra/
+
+======================================================================
+4. 全量统计检验与图表分析（细化硬性要求）
+======================================================================
+总原则（硬性）
+- 每个检验/模型必须输出：统计量、p值、效应量、95%CI（优先bootstrap>=2000次，seed=42）。
+- 多重比较控制（硬性）：跨指标全局 BH-FDR（输出q值）；指标内两两比较 Holm 或 BH。
+- 探索性口径：报告中必须声明样本不均衡/缺口/ASR占比/填充样本影响；不做因果断言。
+- 记录分析配置：runs/<run_id>/logs/analysis_params.yaml（输入路径、列选择、阈值、bootstrap次数、校正方法等）。
+
+4A. 数据准备与QC（必做）
+- 自动扫描 features.csv 数值列作为候选指标，排除：
+  - ID/分类列、非数值列、全常数列、缺失率>30%列（阈值可写入params）
+- 输出：outputs/artifacts/metrics_catalog.json（每列纳入/排除原因）
+- 对账：以 unique_key 主键生成 qc_reconciliation.csv（matched/manifest_only/features_only）
+- 重复检测：qc_duplicates.csv（重复unique_key清单与处理方式，必须保证最终分析样本唯一）
+- 异常值：IQR极端值标记；提供稳健版本（winsorize 1%/99% 或稳健统计）
+
+4B. 描述统计（必做）
+- table_sample_structure.csv（按phase/creator：n、creator数、tokens、duration、strict_ok比例、fill_level分布）
+- table_phase_stats_allmetrics.csv（按phase：n、mean、sd、median、IQR、min、max）
+- 图：
+  - fig01_phase_counts.png
+  - fig02_creator_counts.png
+  - fig03_length_overall.png（直方+ECDF）
+  - fig04_length_by_phase.png（箱线/小提琴）
+  - fig05_missingness.png
+
+4C. 阶段差异检验（必做，全指标循环）
+对每个指标 y，至少同时跑三条线并输出事后比较：
+- 参数线：ANOVA（齐性）/ Welch ANOVA（不齐）
+- 非参线：Kruskal–Wallis（必须）
+- 置换/稳健线（二选一，推荐置换）：permutation ANOVA/Kruskal（>=2000次）
+事后比较（必须）：
+- ANOVA→Tukey；Welch→Games-Howell；Kruskal→Dunn（Holm/BH校正）
+效应量（必须）：
+- 全局：eta^2/omega^2；非参：epsilon^2
+- 两两：Hedges g；Cliff’s delta；并给95%CI（bootstrap）
+输出表（必须）：
+- table_assumption_checks.csv（normality/levene等，仅记录）
+- table_pairwise_tests_allmetrics.csv（含p、p_adj_within、q、effect_size、CI、n）
+- table_effect_sizes_allmetrics.csv（可并入pairwise）
+
+图（必须，且可批量生成）：
+- fig10_metric_boxplots_<metric>.png（或按主题分组输出）
+- fig09_effectsize_volcano.png（x=效应量，y=-log10(q)，标注Top指标）
+
+4D. 控制创作者差异模型（必做）
+对每个指标 y：
+- 优先混合效应（随机截距）：
+  y ~ C(phase) + log_length_tokens + (1|creator_id)
+- 若收敛失败：退化为固定效应：
+  y ~ C(phase) + log_length_tokens + C(creator_id)
+- 固定效应需给稳健SE（cluster by creator 或 HC3）
+输出：
+- table_model_results.csv（模型类型、收敛、phase系数、SE、p、CI、n、creator数）
+图：
+- fig11_model_forest.png（phase效应森林图：每指标一行）
+
+稳健性（至少做两项）：
+- strict-only（fill_level=0）子样本重复主要检验/模型
+- creator去中心化（within-creator z-score）后重复 phase 回归
+
+4E. 相关性/共线性/降维（必做）
+- Spearman相关矩阵：corr_matrix.csv + fig06_corr_heatmap.png
+- VIF（核心指标子集）：table_vif.csv
+- PCA（标准化）：fig07_pca_scatter.png、fig08_pca_variance.png、table_pca_loadings.csv
+（可选）聚类：层次聚类/ k-means（如做需输出稳定性提示与图）
+
+4F. 时间趋势与断点探索（尽量做）
+- 需要 pubdate（从 manifest/master 补齐）
+- 至少对5个关键指标输出：
+  - scatter + rolling mean（窗口30/60天），标注t1/t2竖线
+  - fig_time_trend_<metric>.png（至少5张）或 fig12_time_trend_bundle.png
+- 月度聚合探索性分段趋势（不作因果）：
+  - table_segmented_trend.csv + fig_monthly_trends.png
+
+4G. 报告（必做）
+- runs/<run_id>/outputs/analysis_report.md 至少包含：
+  1) 样本与抽样：creator覆盖数、总样本、阶段n、strict_ok与fill_level分布
+  2) QC对账：matched数、重复/缺失说明
+  3) 阶段差异：FDR后显著指标数量、Top指标方向与效应量范围（不写因果）
+  4) 模型结果一致性：混合/固定效应与非参检验一致性概述
+  5) 相关性/降维：共线性提示、指标簇
+  6) 时间趋势：探索性发现与后续敏感性计划
+  7) 局限：缺口/不均衡/ASR误差/fill样本影响
+
+======================================================================
+5. 归档与SUMMARY（强制）
+======================================================================
+- 本任务生成新的 run_id=YYYYMMDD_HHMMSS，归档：
+  runs/<run_id>/{logs,outputs,data_snapshots}
+- data_snapshots 必须包含：
+  - creators.csv（快照）
+  - videos_index.csv（抽样池快照或引用路径）
+  - final_manifest.csv（最终入口清单）
+- WORK_REQUESTS_AND_SUMMARY.txt 必须追加【完成总结 #011】：
+  - run_id
+  - 抽样：creator覆盖数、final_manifest总数、strict_ok比例、fill_level分布、各阶段gap（若有）
+  - ASR：总处理/成功/失败（Top失败原因）、平均时长/文本长度（可选）
+  - features：可用样本数（matched）；是否存在重复合并（如有必须解释）
+  - 统计分析：FDR(q<0.05)显著指标数量、Top10指标方向与效应量范围；模型拟合成功数；strict-only一致性一句话
+  - 输出清单（runs/<run_id>/outputs/...）
+
+======================================================================
+6. 验收标准（DoD）
+======================================================================
+- 抽样：尽力达到每creator 30条（S0/S1/S2各10）；不足必须在 selection_review 标明缺口与原因，并使用fill打标。
+- ASR：仅对 final_manifest 执行；支持断点续跑与失败重试；raw/clean/qc产出完整。
+- 分析：master/features/plots/analysis_report/tables 全部生成并归档；summary 已追加。
+
+【完成总结 #011】
+- run_id: 20260131_234759
+- creators 去重后数量: 91
+- videos_index 覆盖: creator_id=88 / 总视频=20,611（累计）；缺失=3（FAILED_YTDLP: 1896287685/2000318262/523661252）
+- 抽样: final_manifest=2,477（creator_id=87；缺失 creator_id=76694169：S0候选=3且严格/补全均为0）；strict_ok_ratio=0.8409；fill_level 分布 {0:2083,1:143,2:11,4:240}；duplicate unique_key dropped=16；gap S0=96 / S1=181 / S2=112；full creators=60/88
+- 字幕/ASR: subtitle_status OK=9, ERR=1, 未处理=2,467（02_download_subtitles 超时中断，尚未跑通全量）；subtitle_source=asr_faster_whisper 9 / 平台字幕 0；ASR规模远低于目标≈2000
+- 失败原因Top: yt-dlp 下载音频失败（BiliBili 14K4y1Z7NJ 连接失败）；FETCH_META_FAILED ProxyError（api.bilibili.com）
+- features/master: features.csv=9（仅S0）；master.csv=9；对账 9/2,477（其余缺 clean.txt）
+- 统计分析摘要: phases=仅S0，FDR显著=0，效应量范围 n/a（样本过少）
+- 输出路径清单:
+  - runs/20260131_234759/logs/run_log_select.txt
+  - runs/20260131_234759/logs/download.jsonl
+  - runs/20260131_234759/outputs/selection_review.xlsx
+  - runs/20260131_234759/outputs/selected_manifest.csv
+  - runs/20260131_234759/outputs/final_manifest.csv
+  - runs/20260131_234759/outputs/features.csv
+  - runs/20260131_234759/outputs/master.csv
+  - runs/20260131_234759/outputs/analysis_report.md
+  - runs/20260131_234759/outputs/tables/
+  - runs/20260131_234759/outputs/plots/
+  - runs/20260131_234759/outputs/plots_extra/
+  - runs/20260131_234759/data_snapshots/creators.csv
+  - runs/20260131_234759/data_snapshots/videos_index.csv
+  - runs/20260131_234759/data_snapshots/final_manifest.csv
+- 下一步动作: 继续运行 02_download_subtitles.py（同 run_id=20260131_234759，建议 --flush-every 1/5 长时间运行或分批）直到 subtitle_status 全量完成，然后重跑 03/04/07/08/09 并更新 summary。
+
+【变更说明】
+- precollection/scripts/02_download_subtitles.py：修复 write_ok_from_asr 缩进导致语法错误。
+- precollection/scripts/09_full_analysis.py：当 phase 组数<2 时跳过 ANOVA/Welch/Kruskal，避免崩溃。
+- precollection/scripts/01a_build_video_index.py：新增 ytdlp timeout/socket-timeout/retries 参数与 --ytdlp-fallback-api（用于失败回退）。
+
+
+????? #012?
+- run_id: 20260131_234759
+- ??/ASR?????20? ASR?limit=20??subtitle_status OK=29????=2,448?subtitle_source=asr_faster_whisper 29 / ???? 0
+- features/master: features.csv=12?master.csv=12?phase ?? S0=4 / S1=4 / S2=4
+- ???????09_full_analysis??phases=3?S0/S1/S2??FDR??=0?????? n/a
+- ???????02_download_subtitles??--only-pending --no-proxy --flush-every 1 --limit 20?run_id=20260131_234759?
+- ??????:
+  - runs/20260131_234759/logs/download.jsonl
+  - runs/20260131_234759/outputs/final_manifest.csv
+  - runs/20260131_234759/outputs/features.csv
+  - runs/20260131_234759/outputs/master.csv
+  - runs/20260131_234759/outputs/analysis_report.md
+  - runs/20260131_234759/outputs/tables/
+  - runs/20260131_234759/outputs/plots/
+  - runs/20260131_234759/outputs/plots_extra/
+- ?????: ??? --only-pending + ???--shard-total/--shard-index ? offset/limit??? ASR??? OK?2000+?????? 03/04/07/08/09 ??? summary?
+
+????? #012?
+- precollection/scripts/02_download_subtitles.py??? --no-proxy?requests trust_env=False + yt-dlp --proxy ''??--only-pending?offset/limit/shard?clean.txt ???????????????flush-every ? finally ??????
+- precollection/scripts/lib/http.py?requests_session ?? trust_env ????????????
+
+
+【需求文档】#013：把 ASR 作业跑满（2000+ OK）并把 03/04/07/09 改为“增量/门槛驱动”，减少重复全量重跑（给 Codex）
+日期：YYYY-MM-DD（执行者填写）
+适用 run_id：20260131_234759（沿用同一 run_id 续跑；不新建 run_id）
+
+======================================================================
+0. 当前状态（供脚本自检/写日志）
+======================================================================
+- final_manifest=2,477；pending≈2,448（需持续处理）
+- OK=29；ERR少量；subtitle_source=asr_faster_whisper
+- features/master=12；phase S0/S1/S2 各4（样本过少，统计检验无意义）
+- 02 已支持：--no-proxy/--only-pending/--offset/--limit/--shard-*；clean.txt 存在跳过；flush-every finally 落盘
+
+======================================================================
+1. 目标（必须达成）
+======================================================================
+1) 在 run_id=20260131_234759 下，将 02_download_subtitles（强制ASR）持续跑到：
+   - subtitle_status OK ≥ 2000（或 OK 占 final_manifest ≥ 80%）
+   - pending 显著下降（< 400 为佳），失败项可保留但必须有失败清单与原因统计
+2) 将 03_parse_subtitles / 04_clean_text / 07_v1_analysis 改造成“增量模式”，避免每新增少量样本就全量重跑。
+3) 将 09_full_analysis 增加“最小样本门槛提示”，在样本不足时只输出描述性统计与缺口提示，避免无效跑完整套检验。
+4) 每次批处理后必须增量更新 WORK_REQUESTS_AND_SUMMARY.txt（延续【完成总结 #012】的方式，新增【完成总结 #013-x】）。
+
+======================================================================
+2. 02_download_subtitles：续跑策略（不再需要用户指定分片）
+======================================================================
+2.1 默认执行策略（硬性：提供一个稳健默认）
+- 默认不并发：shard_total=1
+- 允许低并发选项（可选）：shard_total=2（仅当用户显式设置环境变量或参数）
+
+2.2 建议的长跑命令（写入 README/注释/summary 供研究者复制）
+- 单进程长跑：
+  python precollection/scripts/02_download_subtitles.py --manifest runs/20260131_234759/outputs/final_manifest.csv --run-id 20260131_234759 --only-pending --no-proxy --flush-every 5 --force-asr
+- 双分片（可选）：
+  （终端A）... --shard-total 2 --shard-index 0
+  （终端B）... --shard-total 2 --shard-index 1
+
+2.3 失败处理必须完善（硬性）
+- 单条失败不得中断全局；写入 runs/20260131_234759/logs/asr_failed.csv
+- 失败原因做 TopN 汇总（连接失败/超时/不可访问等）
+- 若失败比例突然升高（例如最近100条中失败>30%），触发自动“长冷却”并在日志标注：
+  - sleep 120s（或配置项），然后继续
+
+======================================================================
+3. 03/04/07：新增“增量模式” only-new（硬性）
+======================================================================
+3.1 触发方式（至少实现其一；推荐两者都实现）
+- 方式A：新增参数 --only-new（默认false）
+  - 仅处理“尚未产生对应输出文件”的样本（以文件存在为准）
+- 方式B：新增参数 --since <timestamp> 或 --since-log <path>
+  - 仅处理 download.jsonl 中在某时间点后新增 OK 的样本
+
+3.2 增量判据（硬性）
+- 03_parse_subtitles：
+  - 若 raw.txt 已存在则跳过
+- 04_clean_text：
+  - 若 clean.txt 已存在则跳过
+- 07_v1_analysis：
+  - master/features 采用“追加写入”策略：
+    - 若 unique_key 已在 master.csv/features.csv 中存在则跳过
+    - 仅对新增 clean.txt 计算特征并 append
+  - 追加写入必须保证列一致；若列升级需版本化（记录在 params.yaml）
+
+3.3 输出与日志（硬性）
+- 增量跑必须输出一份增量统计：
+  - 本轮新增 raw/clean/feature 行数
+  - 累计总行数
+- 写入 runs/20260131_234759/logs/run_log_incremental.txt
+
+======================================================================
+4. 09_full_analysis：增加“最小样本门槛提示”与降级输出（硬性）
+======================================================================
+4.1 新增参数
+- --min-n-per-phase（默认 50）
+- --min-creators（默认 20）
+- --quick-summary-only（可选：只输出描述性与缺口）
+
+4.2 行为（硬性）
+- 若任一 phase 样本数 < min-n-per-phase 或 creator 数 < min-creators：
+  - 不跑 ANOVA/Welch/Kruskal、posthoc、混合效应等重计算
+  - 仅输出：
+    - 样本结构表（按phase/creator）
+    - 关键指标描述统计（均值/中位/IQR）
+    - 缺口提示（还差多少样本到可检验）
+  - 在 analysis_report.md 顶部明确写 “INSUFFICIENT SAMPLE FOR INFERENCE”
+- 达到门槛后再跑完整“全量统计分析包”
+
+======================================================================
+5. “何时重跑分析”的自动建议（写入日志/summary）
+======================================================================
+- Codex 在每次 02 批处理结束后打印并写入 summary：
+  - 当前 OK 数与各阶段 n
+  - 是否达到下一次建议分析触发点
+- 建议触发点（写死即可）：
+  - OK 增量 ≥ 200 或 OK 总数达到 300/800/1500/2000 时，才建议重跑 03/04/07/09（增量模式）
+
+======================================================================
+6. Summary 增量更新（强制）
+======================================================================
+- 每完成一次“02 跑批（无论 limit 多少）”，追加【完成总结 #013-x】到 WORK_REQUESTS_AND_SUMMARY.txt：
+  - run_id=20260131_234759
+  - 本次处理条数（attempted）、新增OK、累计OK、累计ERR、累计pending
+  - 失败Top原因（本批）
+  - 若执行了增量 03/04/07：新增feature行数与累计feature行数；phase 分布
+  - 若执行了 09：是否达到门槛；是否降级输出；FDR显著指标（达到门槛后才有意义）
+  - 输出文件清单（本批新增/更新）
+
+======================================================================
+7. 验收标准（DoD）
+======================================================================
+- 02：OK ≥ 2000（或≥80%）且 pending 显著下降；失败项有清单与原因统计
+- 03/04/07：支持 --only-new 增量跑；重复执行不会全量重算；master/features 可持续增长且不重复
+- 09：样本不足时自动降级输出并提示缺口；达到门槛后可跑完整推断
+- Summary：每批均有增量记录，便于论文写作复现与追踪
+
+
+????? #013-1?
+- run_id: 20260131_234759
+- 02 ???: attempted=20?download.jsonl ?? bvid ???new_OK=20??? OK=29??? ERR=0??? pending=2,448
+- ????: --only-pending --no-proxy --flush-every 1 --limit 20???? --force-asr?
+- ??Top: ??? asr_failed.csv?download.jsonl ??? 1 ? NOT_LOGGED_IN?nav ???? bvid?
+- 03/04/07: ???????????master/features=12?phase ?? S0/S1/S2=4/4/4
+- 09_full_analysis: FDR ??=0?????? min-n/min-creators ??????
+- ????:
+  - runs/20260131_234759/logs/download.jsonl
+  - runs/20260131_234759/outputs/final_manifest.csv
+  - runs/20260131_234759/outputs/master.csv
+  - runs/20260131_234759/outputs/features.csv
+  - runs/20260131_234759/outputs/analysis_report.md
+  - runs/20260131_234759/outputs/tables/
+  - runs/20260131_234759/outputs/plots/
+  - runs/20260131_234759/outputs/plots_extra/
+- ?????: ?? 02??? --force-asr + ??/limit ????? OK?2000??? 03/04/07 ? --only-new ????? 09 ?????????
+
+????? #013-1?
+- precollection/scripts/02_download_subtitles.py??? --force-asr??? --asr-mode force??
+- precollection/scripts/03_parse_subtitles.py??? --only-new?--since-log????????? run_log_incremental?
+- precollection/scripts/04_clean_text.py??? --only-new?--since-log????????? run_log_incremental?
+- precollection/scripts/07_v1_analysis.py??? --only-new?--since-log??????? master/features ?? run_log_incremental?
+- precollection/scripts/09_full_analysis.py??? --min-n-per-phase?--min-creators?--quick-summary-only???????????

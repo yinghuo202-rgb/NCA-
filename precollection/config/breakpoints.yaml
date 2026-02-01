@@ -1,0 +1,15 @@
+t1_chatgpt: "2022-11-30"
+t2_deepseek: "2023-11-02"
+window_years: 6
+shift_weeks: [0, -2, 2, -4, 4, -8, 8]
+buffer_weeks: [0, 2, 4]
+default_buffer_weeks: 2
+duration_min_sec: 300
+duration_max_sec: 1800
+exclude_title_keywords: ["直播", "回放", "合集", "联动", "广告", "宣传"]
+batching:
+  batch_size: 10
+  batch_cooldown_sec: 300
+  mid_cooldown_sec: 120
+  sleep_range_sec: [1.2, 2.5]
+  max_retries: 3

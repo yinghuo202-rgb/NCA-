@@ -1,0 +1,24 @@
+__pycache__/
+.venv/
+*.pyc
+*.pyo
+*.log
+*.tmp
+
+# Secrets
+precollection/secrets/
+
+# ASR/generated outputs
+precollection/runs/
+precollection/outputs/
+precollection/logs/
+precollection/data/processed/
+precollection/data/raw/subtitles/
+
+# Audio artifacts (if any)
+precollection/**/*.wav
+precollection/**/*.mp3
+precollection/**/*.m4a
+*.pdf
+*.pptx
+*.docx

@@ -1,0 +1,48 @@
+﻿{
+  "total_rows": 295,
+  "manual_mid_empty": 168,
+  "dedup_count": 91,
+  "duplicate_groups": 24,
+  "duplicate_top": [
+    {
+      "creator_id": "163637592",
+      "count": 5
+    },
+    {
+      "creator_id": "25876945",
+      "count": 4
+    },
+    {
+      "creator_id": "946974",
+      "count": 4
+    },
+    {
+      "creator_id": "2000318262",
+      "count": 3
+    },
+    {
+      "creator_id": "176037767",
+      "count": 3
+    },
+    {
+      "creator_id": "113362335",
+      "count": 3
+    },
+    {
+      "creator_id": "5970160",
+      "count": 3
+    },
+    {
+      "creator_id": "5294454",
+      "count": 3
+    },
+    {
+      "creator_id": "3766866",
+      "count": 2
+    },
+    {
+      "creator_id": "1643718",
+      "count": 2
+    }
+  ]
+}

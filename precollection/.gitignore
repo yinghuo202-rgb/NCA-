@@ -1,0 +1,7 @@
+secrets/cookies.json
+data/raw/subtitles/
+data/processed/
+analysis/figures/
+logs/*.jsonl
+__pycache__/
+*.pyc

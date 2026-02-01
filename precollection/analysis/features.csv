@@ -1,0 +1,13 @@
+﻿series,creator_id,bvid,pub_date,actual_stage,duration_sec,chars,tokens,sentences,mean_sentence_chars,punct_per_1k_tokens,connectors_per_1k_tokens,frame_markers_per_1k_tokens,modality_per_1k_tokens
+fanshi_newanime,Creator_F,BV1QY4y1V7RY,2022-06-02,S0,670,3551,3517,10,355.1,99.232,2.843,0.0,1.706
+fanshi_newanime,Creator_F,BV1rW4y18743,2022-08-27,S0,740,3791,3768,2,1895.5,0.796,2.919,0.0,1.062
+fanshi_newanime,Creator_F,BV1Py4y1Z7p6,2023-02-25,S1,860,4403,4322,6,733.833,31.698,4.165,0.0,1.388
+fanshi_newanime,Creator_F,BV17z4y1M76T,2023-08-28,S1,965,4851,4777,7,693.0,56.311,5.233,0.0,1.675
+fanshi_newanime,Creator_F,BV1Yi421v7uE,2024-06-02,S2,1085,5345,5265,1,5345.0,2.659,7.977,0.0,3.229
+fanshi_newanime,Creator_F,BV1yUp4eeEQ2,2024-09-07,S2,863,3831,3791,6,638.5,54.867,4.221,0.0,2.374
+shuianxiaoxi,Creator_M,BV15v411T7ym,2021-08-15,S0,1075,5927,5919,1,5927.0,0.676,13.009,0.0,5.744
+shuianxiaoxi,Creator_M,BV19W4y1h78S,2022-08-14,S0,867,5043,5025,1,5043.0,0.0,7.363,0.0,3.383
+shuianxiaoxi,Creator_M,BV1ED4y1n7MD,2023-01-22,S1,4814,28162,28067,1,28162.0,0.143,12.826,0.071,7.268
+shuianxiaoxi,Creator_M,BV1Tm4y1m7ty,2023-04-09,S1,1599,9926,9720,2,4963.0,0.617,7.51,0.103,6.481
+shuianxiaoxi,Creator_M,BV1Qb4y1M7TB,2023-11-19,S2,1186,7191,7123,169,42.55,85.077,7.862,0.14,4.914
+shuianxiaoxi,Creator_M,BV1tWvDBkEbb,2026-01-01,S2,2067,11688,11646,1,11688.0,0.429,14.34,0.0,9.102
