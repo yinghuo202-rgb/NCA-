@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import re
+import shutil
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -694,6 +695,51 @@ def _transformed_outcome(df: pd.DataFrame, spec: FeatureSpec) -> pd.Series:
     return df[spec.report_col].astype(float)
 
 
+def _fit_count_regression(
+    *,
+    formula: str,
+    data: pd.DataFrame,
+    count_col: str,
+    group_col: str,
+    offset: pd.Series,
+) -> tuple[Any, dict[str, Any]]:
+    diagnostics: dict[str, Any] = {
+        "count_family": "poisson_fe_offset",
+        "dispersion": np.nan,
+        "alpha": np.nan,
+    }
+    poisson_fit = smf.glm(
+        formula=formula,
+        data=data,
+        family=sm.families.Poisson(),
+        offset=offset,
+    ).fit(cov_type="cluster", cov_kwds={"groups": data[group_col]}, maxiter=200)
+    mu = poisson_fit.mu
+    pearson = np.sum(((data[count_col] - mu) ** 2) / np.clip(mu, 1e-6, None))
+    dispersion = float(pearson / max(len(data) - len(poisson_fit.params), 1))
+    diagnostics["dispersion"] = dispersion
+    fit = poisson_fit
+    if dispersion >= 3.0:
+        try:
+            nb_fit = smf.negativebinomial(
+                formula=formula,
+                data=data,
+                offset=offset,
+            ).fit(
+                disp=False,
+                maxiter=300,
+                cov_type="cluster",
+                cov_kwds={"groups": data[group_col]},
+            )
+            if np.isfinite(float(getattr(nb_fit, "llf", np.nan))):
+                fit = nb_fit
+                diagnostics["count_family"] = "negative_binomial_fe_offset"
+                diagnostics["alpha"] = float(nb_fit.params.get("alpha", np.nan))
+        except Exception as exc:  # noqa: BLE001
+            diagnostics["nb_fallback_error"] = f"{type(exc).__name__}: {exc}"
+    return fit, diagnostics
+
+
 def _fit_panel_model(
     df: pd.DataFrame,
     spec: FeatureSpec,
@@ -720,16 +766,15 @@ def _fit_panel_model(
             rhs_terms.append("C(transcript_provenance)")
         formula = f"{spec.count_col} ~ " + " + ".join(rhs_terms)
         try:
-            model = smf.glm(
+            fit, count_diag = _fit_count_regression(
                 formula=formula,
                 data=df,
-                family=sm.families.Poisson(),
+                count_col=spec.count_col,
+                group_col="creator_id",
                 offset=np.log(df["length_tokens"].clip(lower=1.0)),
             )
-            fit = model.fit(cov_type="cluster", cov_kwds={"groups": df["creator_id"]}, maxiter=200)
-            mu = fit.mu
-            pearson = np.sum(((df[spec.count_col] - mu) ** 2) / np.clip(mu, 1e-6, None))
-            diagnostics["dispersion"] = float(pearson / max(len(df) - len(fit.params), 1))
+            diagnostics.update(count_diag)
+            diagnostics["family"] = str(count_diag.get("count_family") or diagnostics["family"])
             params = fit.params
             conf = fit.conf_int()
             pvals = fit.pvalues
@@ -758,6 +803,7 @@ def _fit_panel_model(
                         "n_videos": int(len(df)),
                         "n_creators": int(df["creator_id"].nunique()),
                         "control_set": "metadata" if extra_terms else "base",
+                        "model_family_used": diagnostics["family"],
                     }
                 )
         except Exception as exc:  # noqa: BLE001
@@ -801,6 +847,7 @@ def _fit_panel_model(
                         "n_videos": int(len(df)),
                         "n_creators": int(df["creator_id"].nunique()),
                         "control_set": "metadata" if extra_terms else "base",
+                        "model_family_used": diagnostics["family"],
                     }
                 )
         except Exception as exc:  # noqa: BLE001
@@ -1000,12 +1047,13 @@ def _fit_break_model(
         formula = f"{spec.count_col} ~ post_break + weeks_after_break + time_weeks + C(creator_id)"
         if use_prov:
             formula += " + C(transcript_provenance)"
-        fit = smf.glm(
+        fit, count_diag = _fit_count_regression(
             formula=formula,
             data=work,
-            family=sm.families.Poisson(),
+            count_col=spec.count_col,
+            group_col="creator_id",
             offset=np.log(work["length_tokens"].clip(lower=1.0)),
-        ).fit(cov_type="cluster", cov_kwds={"groups": work["creator_id"]}, maxiter=200)
+        )
         params = fit.params
         conf = fit.conf_int()
         pvals = fit.pvalues
@@ -1022,6 +1070,7 @@ def _fit_break_model(
                     "n_videos": int(len(work)),
                     "n_creators": int(work["creator_id"].nunique()),
                     "effect_scale": "log_rate",
+                    "model_family_used": str(count_diag.get("count_family") or "poisson_fe_offset"),
                 }
             )
     else:
@@ -1143,12 +1192,13 @@ def _creator_month_its(df: pd.DataFrame, specs: list[FeatureSpec], t1: pd.Timest
         if use_prov:
             formula += " + C(transcript_provenance)"
         if spec.kind == "count" and spec.count_col:
-            fit = smf.glm(
+            fit, count_diag = _fit_count_regression(
                 formula=f"{spec.count_col} ~ post_t1 + post_t2 + months_after_t1 + months_after_t2 + C(creator_id)" + (" + C(transcript_provenance)" if use_prov else ""),
                 data=month_df,
-                family=sm.families.Poisson(),
+                count_col=spec.count_col,
+                group_col="creator_id",
                 offset=np.log(month_df["length_tokens"].clip(lower=1.0)),
-            ).fit(cov_type="cluster", cov_kwds={"groups": month_df["creator_id"]}, maxiter=200)
+            )
             conf = fit.conf_int()
             for term in ["post_t1", "post_t2", "months_after_t1", "months_after_t2"]:
                 low, high = conf.loc[term].tolist()
@@ -1161,6 +1211,7 @@ def _creator_month_its(df: pd.DataFrame, specs: list[FeatureSpec], t1: pd.Timest
                         "conf_high": float(high),
                         "p_value": float(fit.pvalues[term]),
                         "n_creator_months": int(len(month_df)),
+                        "model_family_used": str(count_diag.get("count_family") or "poisson_fe_offset"),
                     }
                 )
         else:
@@ -1178,6 +1229,7 @@ def _creator_month_its(df: pd.DataFrame, specs: list[FeatureSpec], t1: pd.Timest
                         "conf_high": float(high),
                         "p_value": float(fit.pvalues[term]),
                         "n_creator_months": int(len(month_df)),
+                        "model_family_used": "ols_fe_clustered",
                     }
                 )
     return pd.DataFrame(out_rows)
@@ -1251,29 +1303,32 @@ def _write_preprocessing_log(
     summary = pd.DataFrame(
         [
             {
-                "metric": "mean_sent_len_chars_before",
-                "mean": qc_df["mean_sent_len_chars_before"].mean(),
-                "median": qc_df["mean_sent_len_chars_before"].median(),
+                "metric": "mean_sent_len_chars",
+                "before_mean": qc_df["mean_sent_len_chars_before"].mean(),
+                "after_mean": qc_df["mean_sent_len_chars_after"].mean(),
+                "before_median": qc_df["mean_sent_len_chars_before"].median(),
+                "after_median": qc_df["mean_sent_len_chars_after"].median(),
             },
             {
-                "metric": "mean_sent_len_chars_after",
-                "mean": qc_df["mean_sent_len_chars_after"].mean(),
-                "median": qc_df["mean_sent_len_chars_after"].median(),
+                "metric": "comma_period_ratio",
+                "before_mean": qc_df["comma_period_ratio_before"].mean(),
+                "after_mean": qc_df["comma_period_ratio_after"].mean(),
+                "before_median": qc_df["comma_period_ratio_before"].median(),
+                "after_median": qc_df["comma_period_ratio_after"].median(),
             },
             {
-                "metric": "comma_period_ratio_before",
-                "mean": qc_df["comma_period_ratio_before"].mean(),
-                "median": qc_df["comma_period_ratio_before"].median(),
+                "metric": "segment_count_per_1000_tokens",
+                "before_mean": qc_df["segment_count_per_1000_tokens_before"].mean(),
+                "after_mean": qc_df["segment_count_per_1000_tokens_after"].mean(),
+                "before_median": qc_df["segment_count_per_1000_tokens_before"].median(),
+                "after_median": qc_df["segment_count_per_1000_tokens_after"].median(),
             },
             {
-                "metric": "comma_period_ratio_after",
-                "mean": qc_df["comma_period_ratio_after"].mean(),
-                "median": qc_df["comma_period_ratio_after"].median(),
-            },
-            {
-                "metric": "segment_count_per_1000_tokens_after",
-                "mean": qc_df["segment_count_per_1000_tokens_after"].mean(),
-                "median": qc_df["segment_count_per_1000_tokens_after"].median(),
+                "metric": "avg_tokens_per_segment",
+                "before_mean": qc_df["avg_tokens_per_segment_before"].mean(),
+                "after_mean": qc_df["avg_tokens_per_segment_after"].mean(),
+                "before_median": qc_df["avg_tokens_per_segment_before"].median(),
+                "after_median": qc_df["avg_tokens_per_segment_after"].median(),
             },
         ]
     )
@@ -1390,7 +1445,7 @@ Structure composite components:
 - `formulaic_transition_density` is dropped from formal reporting because it overlaps heavily with `connective_density`, `template_density`, and heading-like markers.
 
 ## Measurement rules
-- Count-like features use Poisson fixed-effects models with offset(log(tokens)).
+- Count-like features use Poisson or Negative Binomial fixed-effects models with offset(log(tokens)), depending on overdispersion.
 - Bounded ratios use clipped-logit transforms with creator fixed effects and clustered standard errors.
 - Positive continuous variables use log transforms when needed.
 - Breakpoint robustness uses transformed outcomes for stability and interpretability, not raw absolute counts.
@@ -1417,6 +1472,7 @@ def _write_model_plan(out_dir: Path) -> None:
 - clustered SE by creator: yes
 - controls: log(tokens) or offset(log(tokens)), continuous time trend, transcript provenance when variation exists
 - metadata-controlled robustness: log(duration), title-question flag, bracket-title flag, series/part flag
+- count-like outcomes: Poisson with Negative Binomial fallback when overdispersion is high
 
 ## Model B: random-slope mixed model
 - creator random intercept: yes
@@ -1487,7 +1543,7 @@ def _plot_feature_distributions(path: Path, df: pd.DataFrame) -> None:
     plt.close(fig)
 
 
-def _plot_forest(path: Path, heter_df: pd.DataFrame, feature: str) -> None:
+def _plot_forest(path: Path, heter_df: pd.DataFrame, feature: str, *, show_creator_labels: bool = True) -> None:
     sub = heter_df[(heter_df["row_type"] == "creator_effect") & (heter_df["feature"] == feature)].copy()
     if sub.empty:
         return
@@ -1501,9 +1557,13 @@ def _plot_forest(path: Path, heter_df: pd.DataFrame, feature: str) -> None:
         ax.axvline(0.0, color="black", linewidth=0.8)
         ax.set_title(f"{feature}: {contrast}")
         ax.set_xlabel("Creator-specific effect")
-        step = max(1, len(y) // 20)
-        ax.set_yticks(y[::step])
-        ax.set_yticklabels(cur["creator_name"].iloc[::step])
+        if show_creator_labels:
+            step = max(1, len(y) // 20)
+            ax.set_yticks(y[::step])
+            ax.set_yticklabels(cur["creator_name"].iloc[::step])
+        else:
+            ax.set_yticks([])
+            ax.set_ylabel("")
         ax.grid(axis="x", linestyle="--", alpha=0.3)
     fig.tight_layout()
     fig.savefig(path)
@@ -1539,13 +1599,14 @@ def _plot_event_time(path: Path, event_df: pd.DataFrame, feature: str) -> None:
 
 
 def _plot_segmentation_qc(path: Path, qc_df: pd.DataFrame) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4), dpi=160)
+    fig, axes = plt.subplots(2, 2, figsize=(11, 8), dpi=160)
     pairs = [
         ("mean_sent_len_chars_before", "mean_sent_len_chars_after", "Segment Length"),
         ("comma_period_ratio_before", "comma_period_ratio_after", "Comma / Boundary"),
-        ("legacy_sentence_count", "repaired_segment_count", "Boundary Count"),
+        ("segment_count_per_1000_tokens_before", "segment_count_per_1000_tokens_after", "Boundary Density"),
+        ("avg_tokens_per_segment_before", "avg_tokens_per_segment_after", "Tokens per Segment"),
     ]
-    for ax, (left, right, title) in zip(axes, pairs):
+    for ax, (left, right, title) in zip(axes.ravel(), pairs):
         ax.boxplot(
             [qc_df[left].astype(float).to_numpy(), qc_df[right].astype(float).to_numpy()],
             tick_labels=["Legacy", "Repaired"],
@@ -1556,6 +1617,106 @@ def _plot_segmentation_qc(path: Path, qc_df: pd.DataFrame) -> None:
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
+
+
+def _creator_alias_map(df: pd.DataFrame) -> dict[str, str]:
+    creator_ids = sorted(df["creator_id"].astype(str).dropna().unique().tolist())
+    return {creator_id: f"Creator_{idx:03d}" for idx, creator_id in enumerate(creator_ids, start=1)}
+
+
+def _apply_creator_aliases(df: pd.DataFrame, alias_map: dict[str, str]) -> pd.DataFrame:
+    out = df.copy()
+    if "creator_id" in out.columns:
+        out["creator_id"] = out["creator_id"].astype(str).map(alias_map).where(out["creator_id"].astype(str) != "", out["creator_id"])
+    if "creator_name" in out.columns:
+        if "creator_id" in out.columns:
+            out["creator_name"] = out["creator_id"].astype(str).where(out["creator_id"].astype(str) != "", out["creator_name"])
+        else:
+            out["creator_name"] = out["creator_name"].astype(str)
+    return out
+
+
+def _copy_text_file(src: Path, dst: Path) -> None:
+    dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def _write_blind_review_exports(
+    out_dir: Path,
+    figures_dir: Path,
+    *,
+    main_df: pd.DataFrame,
+    heterogeneity_results: pd.DataFrame,
+    sample_flow: pd.DataFrame,
+    feature_decision_path: Path,
+    feature_qc_path: Path,
+    corr_path: Path,
+    main_results_path: Path,
+    metadata_results_path: Path,
+    robustness_path: Path,
+    model_diagnostics_path: Path,
+    breakpoint_path: Path,
+    event_time_path: Path,
+    creator_month_path: Path,
+    sample_flow_md_path: Path,
+    old_vs_new_path: Path,
+    feature_spec_path: Path,
+    results_abstract_path: Path,
+    sample_description_path: Path,
+) -> None:
+    blind_fig_dir = out_dir / "blind_review_figure_set"
+    blind_tbl_dir = out_dir / "blind_review_tables"
+    blind_fig_dir.mkdir(parents=True, exist_ok=True)
+    blind_tbl_dir.mkdir(parents=True, exist_ok=True)
+
+    alias_map = _creator_alias_map(main_df)
+    blind_heter = _apply_creator_aliases(heterogeneity_results, alias_map)
+    blind_heter.to_csv(blind_tbl_dir / "heterogeneity_results.csv", index=False, encoding="utf-8-sig")
+
+    sample_flow.to_csv(blind_tbl_dir / "sample_flow.csv", index=False, encoding="utf-8-sig")
+    shutil.copyfile(feature_decision_path, blind_tbl_dir / "feature_decision_table.csv")
+    shutil.copyfile(feature_qc_path, blind_tbl_dir / "feature_qc_table.csv")
+    shutil.copyfile(corr_path, blind_tbl_dir / "correlation_matrix.csv")
+    shutil.copyfile(main_results_path, blind_tbl_dir / "main_results_table.csv")
+    shutil.copyfile(metadata_results_path, blind_tbl_dir / "metadata_controlled_results.csv")
+    shutil.copyfile(breakpoint_path, blind_tbl_dir / "breakpoint_sensitivity_table.csv")
+    shutil.copyfile(event_time_path, blind_tbl_dir / "event_time_results.csv")
+    shutil.copyfile(creator_month_path, blind_tbl_dir / "creator_month_its_results.csv")
+    shutil.copyfile(sample_description_path, blind_tbl_dir / "sample_description_table.csv")
+    _copy_text_file(sample_flow_md_path, blind_tbl_dir / "sample_flow.md")
+    _copy_text_file(old_vs_new_path, blind_tbl_dir / "old_vs_new_spec.md")
+    _copy_text_file(feature_spec_path, blind_tbl_dir / "feature_spec.md")
+    _copy_text_file(robustness_path, blind_tbl_dir / "robustness_summary.md")
+    _copy_text_file(model_diagnostics_path, blind_tbl_dir / "model_diagnostics.md")
+    _copy_text_file(results_abstract_path, blind_tbl_dir / "results_for_abstract.md")
+
+    shutil.copyfile(figures_dir / "sample_flow_figure.png", blind_fig_dir / "figure_01_sample_flow.png")
+    shutil.copyfile(figures_dir / "phase_distribution_figure.png", blind_fig_dir / "figure_02_phase_distribution.png")
+    shutil.copyfile(figures_dir / "main_feature_distributions.png", blind_fig_dir / "figure_03_main_feature_distributions.png")
+    shutil.copyfile(figures_dir / "event_time_figure.png", blind_fig_dir / "figure_05_event_time.png")
+    shutil.copyfile(figures_dir / "segmentation_qc_before_after.png", blind_fig_dir / "figure_06_segmentation_qc.png")
+    _plot_forest(blind_fig_dir / "figure_04_creator_effect_forest.png", blind_heter, "connective_density", show_creator_labels=False)
+
+    readme = """# Blind Review Export Package
+
+This directory contains two output modes:
+
+1. Internal working outputs:
+   The standard files in the current output directory remain the internal working set.
+
+2. Blind review outputs:
+   - `blind_review_figure_set/`
+   - `blind_review_tables/`
+
+Blind review rules used here:
+- creator-identifying labels are removed from figures or replaced with neutral creator IDs in tables;
+- local usernames, local file paths, and machine-specific folders are not included;
+- the formal sample specification remains 2412 videos / 87 creators;
+- the balanced sample remains a robustness layer only.
+
+Files in `blind_review_tables/` are review-facing copies of the key quantitative tables and summaries.
+Files in `blind_review_figure_set/` are review-facing figures with neutral filenames and no creator-identifying labels.
+"""
+    (out_dir / "blind_review_export_readme.md").write_text(readme, encoding="utf-8")
 
 
 def main() -> int:
@@ -1706,6 +1867,10 @@ def main() -> int:
                 "repaired_segment_count": rec["repaired_segment_count"],
                 "mean_sent_len_chars_before": rec["legacy_mean_sent_len_chars"],
                 "mean_sent_len_chars_after": rec["repaired_mean_segment_chars"],
+                "segment_count_per_1000_tokens_before": float(rec["legacy_sentence_count"]) * 1000.0 / float(max(rec["length_tokens"], 1)),
+                "segment_count_per_1000_tokens_after": rec["segment_count_per_1000_tokens"],
+                "avg_tokens_per_segment_before": float(rec["length_tokens"]) / float(max(rec["legacy_sentence_count"], 1)),
+                "avg_tokens_per_segment_after": rec["avg_tokens_per_segment"],
                 "legacy_mean_sent_len_chars": rec["legacy_mean_sent_len_chars"],
                 "repaired_mean_segment_chars": rec["repaired_mean_segment_chars"],
                 "comma_period_ratio_before": rec["legacy_comma_period_ratio"],
@@ -1713,8 +1878,6 @@ def main() -> int:
                 "legacy_comma_period_ratio": rec["legacy_comma_period_ratio"],
                 "repaired_comma_period_ratio": rec["repaired_comma_period_ratio"],
                 "segment_boundary_density": rec["segment_boundary_density"],
-                "segment_count_per_1000_tokens_after": rec["segment_count_per_1000_tokens"],
-                "avg_tokens_per_segment_after": rec["avg_tokens_per_segment"],
                 "segment_length_cv": rec["segment_length_cv"],
                 "removed_onomatopoeia_count": removed_count,
             }
@@ -2021,7 +2184,7 @@ The 75-text / 5-creator design belongs to the pilot / precollection stage and wa
 
 ## 2. Why `connectives_total` is no longer allowed as a headline main result
 
-Raw absolute connective counts are confounded by transcript length. In the rebuild, headline reporting switches to `connective_density` and the main count model uses Poisson fixed effects with `offset(log(tokens))`. This makes the cohesion signal length-corrected and directly comparable across videos.
+Raw absolute connective counts are confounded by transcript length. In the rebuild, headline reporting switches to `connective_density` and the main count model uses Poisson or Negative Binomial fixed effects with `offset(log(tokens))` as needed. This makes the cohesion signal length-corrected and directly comparable across videos.
 
 ## 3. Why breakpoint analysis is downgraded to robustness only
 
@@ -2030,6 +2193,10 @@ The breakpoint checks are weaker than the within-creator panel-drift evidence, a
 ## 4. How the abstract spec (1000 / 990 / 81) relates to the current formal report spec (2412 / 87)
 
 The `1000 / 990 / 81` numbers appear in the current draft manuscript / design documents as an earlier write-up snapshot: roughly 1,000 planned videos, 990 analyzable videos, and 81 creators in an earlier formalization stage. The current production rerun has expanded beyond that snapshot and now yields **{len(df)} analyzable videos across {df['creator_id'].nunique()} creators**. In this rebuild, `1000 / 990 / 81` is documented only for reconciliation, while `2412 / 87` is adopted as the single formal main sample specification.
+
+## 5. How the balanced sample (1260 / 42) is used
+
+The `1260 / 42` layer is retained only as a robustness subset built from creators who meet the exact 10x3 threshold. It is not a competing formal sample specification and it does not replace the sole formal main sample of `2412 / 87`.
 """
     (out_dir / "old_vs_new_spec.md").write_text(old_vs_new, encoding="utf-8")
 
@@ -2094,6 +2261,8 @@ The `1000 / 990 / 81` numbers appear in the current draft manuscript / design do
         "- `metadata_controlled_results.csv`",
         "- `results_for_abstract.md`",
         "- `old_vs_new_spec.md`",
+        "- `blind_review_figure_set/`",
+        "- `blind_review_tables/`",
     ]
     (out_dir / "formal_analysis_report.md").write_text("\n".join(report_lines), encoding="utf-8")
 
@@ -2116,6 +2285,29 @@ The `1000 / 990 / 81` numbers appear in the current draft manuscript / design do
         ]
     )
     figures_index.to_csv(out_dir / "main_figures_index.csv", index=False, encoding="utf-8-sig")
+
+    _write_blind_review_exports(
+        out_dir,
+        figures_dir,
+        main_df=df,
+        heterogeneity_results=heterogeneity_results,
+        sample_flow=sample_flow,
+        feature_decision_path=out_dir / "feature_decision_table.csv",
+        feature_qc_path=out_dir / "feature_qc_table.csv",
+        corr_path=out_dir / "correlation_matrix.csv",
+        main_results_path=out_dir / "main_results_table.csv",
+        metadata_results_path=out_dir / "metadata_controlled_results.csv",
+        robustness_path=out_dir / "robustness_summary.md",
+        model_diagnostics_path=out_dir / "model_diagnostics.md",
+        breakpoint_path=out_dir / "breakpoint_sensitivity_table.csv",
+        event_time_path=out_dir / "event_time_results.csv",
+        creator_month_path=out_dir / "creator_month_its_results.csv",
+        sample_flow_md_path=out_dir / "sample_flow.md",
+        old_vs_new_path=out_dir / "old_vs_new_spec.md",
+        feature_spec_path=out_dir / "feature_spec.md",
+        results_abstract_path=out_dir / "results_for_abstract.md",
+        sample_description_path=out_dir / "sample_description_table.csv",
+    )
 
     _log(f"Formal rebuild complete: {out_dir}", lines=logs)
     (out_dir / "formal_rebuild_run_log.txt").write_text("\n".join(logs), encoding="utf-8")
