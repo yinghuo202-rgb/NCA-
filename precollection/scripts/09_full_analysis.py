@@ -2,161 +2,518 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import scipy.stats as st
 
+from lib.breakpoints_ext import load_breakpoints_yaml
 from lib.paths import ensure_dirs, get_project_paths
 from lib.run_utils import init_run_dirs, make_run_id
 
 
-def _log(lines: list[str], msg: str) -> None:
+PRIMARY_STYLE_METRICS = [
+    "mattr",
+    "mean_word_len",
+    "mean_sent_len_chars",
+    "stop_ratio",
+    "func_ratio",
+    "templates_density",
+    "connectives_total",
+    "comma_period_ratio",
+]
+PAIRWISE_PHASES = [("S0", "S1"), ("S1", "S2"), ("S0", "S2")]
+
+
+def _log(lines: list[str], message: str) -> None:
     stamp = datetime.now().isoformat(timespec="seconds")
-    line = f"[{stamp}] {msg}"
+    line = f"[{stamp}] {message}"
     print(line)
     lines.append(line)
 
 
-def _bh_fdr(pvals: list[float]) -> list[float]:
-    m = len(pvals)
-    if m == 0:
+def _bh_fdr(values: list[float]) -> list[float]:
+    if not values:
         return []
-    order = np.argsort(pvals)
-    adj = [0.0] * m
+    values_arr = np.asarray(values, dtype=float)
+    order = np.argsort(values_arr)
+    adjusted = np.zeros(len(values_arr), dtype=float)
     prev = 1.0
-    for i in range(m - 1, -1, -1):
-        idx = order[i]
-        rank = i + 1
-        val = pvals[idx] * m / rank
-        prev = min(prev, val)
-        adj[idx] = min(prev, 1.0)
-    return adj
+    m = float(len(values_arr))
+    for rank_rev, idx in enumerate(order[::-1], start=1):
+        rank = len(values_arr) - rank_rev + 1
+        candidate = min(prev, values_arr[idx] * m / float(rank))
+        adjusted[idx] = min(candidate, 1.0)
+        prev = candidate
+    return adjusted.tolist()
 
 
-def _welch_anova(groups: list[np.ndarray]) -> tuple[float, float, float, float]:
-    # Returns F, df1, df2, p
-    import scipy.stats as st  # type: ignore
-
-    k = len(groups)
-    means = np.array([g.mean() for g in groups])
-    ns = np.array([len(g) for g in groups], dtype=float)
-    vars_ = np.array([g.var(ddof=1) if len(g) > 1 else 0.0 for g in groups])
-    # avoid zero variance
-    vars_[vars_ <= 1e-12] = 1e-12
-    weights = ns / vars_
-    w_sum = weights.sum()
-    mean_w = (weights * means).sum() / w_sum
-    num = (weights * (means - mean_w) ** 2).sum() / (k - 1)
-    term = ((1 - weights / w_sum) ** 2) / (ns - 1)
-    term = np.where(np.isfinite(term), term, 0.0)
-    denom = 1 + (2 * (k - 2) / (k**2 - 1)) * term.sum()
-    f = num / denom
-    df1 = k - 1
-    df2 = (k**2 - 1) / (3 * term.sum()) if term.sum() > 0 else 1e9
-    p = st.f.sf(f, df1, df2)
-    return float(f), float(df1), float(df2), float(p)
-
-
-def _cohens_d(a: np.ndarray, b: np.ndarray) -> float:
-    if len(a) == 0 or len(b) == 0:
-        return 0.0
-    va = a.var(ddof=1) if len(a) > 1 else 0.0
-    vb = b.var(ddof=1) if len(b) > 1 else 0.0
-    denom = math.sqrt((va + vb) / 2.0) if (va + vb) > 0 else 1.0
-    return float((a.mean() - b.mean()) / denom)
-
-
-def _bootstrap_ci(a: np.ndarray, b: np.ndarray, n: int = 500, alpha: float = 0.05) -> tuple[float, float]:
-    if len(a) == 0 or len(b) == 0:
+def _bootstrap_ci(values: np.ndarray, *, n_boot: int = 1000, alpha: float = 0.05) -> tuple[float, float]:
+    if values.size == 0:
         return (0.0, 0.0)
     rng = np.random.default_rng(42)
-    vals = []
-    for _ in range(n):
-        sa = rng.choice(a, size=len(a), replace=True)
-        sb = rng.choice(b, size=len(b), replace=True)
-        vals.append(_cohens_d(sa, sb))
-    lo = np.percentile(vals, 100 * (alpha / 2))
-    hi = np.percentile(vals, 100 * (1 - alpha / 2))
-    return float(lo), float(hi)
+    draws = []
+    for _ in range(n_boot):
+        sample = rng.choice(values, size=values.size, replace=True)
+        draws.append(float(np.mean(sample)))
+    lo = float(np.percentile(draws, 100 * (alpha / 2.0)))
+    hi = float(np.percentile(draws, 100 * (1.0 - alpha / 2.0)))
+    return (lo, hi)
 
 
-def _vif(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    out = []
-    X = df[cols].to_numpy(dtype=float)
-    for i, c in enumerate(cols):
-        y = X[:, i]
-        X_others = np.delete(X, i, axis=1)
-        if X_others.size == 0:
-            out.append({"feature": c, "vif": 1.0})
+def _dz(values: np.ndarray) -> float:
+    if values.size < 2:
+        return 0.0
+    std = float(np.std(values, ddof=1))
+    if std <= 1e-12:
+        return 0.0
+    return float(np.mean(values) / std)
+
+
+def _ols_cluster_robust(
+    X: np.ndarray,
+    y: np.ndarray,
+    *,
+    clusters: np.ndarray,
+    param_names: list[str],
+) -> dict[str, Any] | None:
+    n, k = X.shape
+    if n <= k or len(np.unique(clusters)) < 5:
+        return None
+
+    xtx_inv = np.linalg.pinv(X.T @ X)
+    beta = xtx_inv @ X.T @ y
+    fitted = X @ beta
+    resid = y - fitted
+
+    meat = np.zeros((k, k), dtype=float)
+    unique_clusters = np.unique(clusters)
+    for cluster in unique_clusters:
+        idx = np.where(clusters == cluster)[0]
+        Xg = X[idx, :]
+        eg = resid[idx].reshape(-1, 1)
+        meat += Xg.T @ (eg @ eg.T) @ Xg
+
+    g = float(len(unique_clusters))
+    correction = 1.0
+    if g > 1 and n > k:
+        correction = (g / (g - 1.0)) * ((n - 1.0) / (n - k))
+    cov = correction * (xtx_inv @ meat @ xtx_inv)
+    se = np.sqrt(np.clip(np.diag(cov), a_min=0.0, a_max=None))
+
+    t_stats = np.full(k, np.nan, dtype=float)
+    p_values = np.full(k, np.nan, dtype=float)
+    valid = se > 1e-12
+    t_stats[valid] = beta[valid] / se[valid]
+    df = max(int(g) - 1, 1)
+    p_values[valid] = 2.0 * st.t.sf(np.abs(t_stats[valid]), df=df)
+
+    ss_res = float(np.sum((y - fitted) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+    return {
+        "param_names": param_names,
+        "coef": beta,
+        "se": se,
+        "t": t_stats,
+        "p": p_values,
+        "n": int(n),
+        "k": int(k),
+        "clusters": int(g),
+        "r2": float(r2),
+    }
+
+
+def _numeric_columns(df: pd.DataFrame, *, excluded: set[str]) -> list[str]:
+    cols: list[str] = []
+    for column in df.columns:
+        if column in excluded:
             continue
-        # add intercept
-        Xo = np.column_stack([np.ones(X_others.shape[0]), X_others])
-        coef, *_ = np.linalg.lstsq(Xo, y, rcond=None)
-        y_hat = Xo @ coef
-        ss_res = np.sum((y - y_hat) ** 2)
-        ss_tot = np.sum((y - y.mean()) ** 2)
-        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
-        vif = 1.0 / max(1e-6, 1 - r2)
-        out.append({"feature": c, "vif": float(vif), "r2": float(r2)})
-    return pd.DataFrame(out)
+        numeric = pd.to_numeric(df[column], errors="coerce")
+        if int(numeric.notna().sum()) >= 5:
+            df[column] = numeric
+            cols.append(column)
+    return cols
 
 
-def _fixed_effects(df: pd.DataFrame, metric: str) -> dict[str, Any]:
-    # OLS with creator_id fixed effects + phase dummies
-    y = pd.to_numeric(df[metric], errors="coerce").to_numpy(dtype=float)
-    mask = np.isfinite(y)
-    work = df.loc[mask].copy()
-    y = y[mask]
-    if len(y) < 5:
-        return {"metric": metric, "n": len(y), "r2": 0.0}
-    creators = work["creator_id"].astype(str).fillna("NA").tolist()
-    phases = work["phase"].astype(str).fillna("NA").tolist()
+def _prepare_dataset(features: pd.DataFrame, manifest: pd.DataFrame, cfg) -> tuple[pd.DataFrame, list[str], list[str]]:
+    key_feat = "video_id" if "video_id" in features.columns else "bvid"
+    key_man = "unique_key" if "unique_key" in manifest.columns else "bvid"
+    merge_cols = [
+        key_man,
+        "bvid",
+        "creator_id",
+        "creator_name",
+        "creator_group",
+        "phase_base",
+        "pubdate",
+        "pub_date",
+        "strict_ok",
+        "fill_level",
+        "fill_reason",
+        "subtitle_status",
+    ]
+    merge_cols = [column for column in merge_cols if column in manifest.columns]
+    df = features.merge(
+        manifest[merge_cols],
+        how="left",
+        left_on=key_feat,
+        right_on=key_man,
+        suffixes=("", "_m"),
+    )
 
-    creator_cats = sorted(set(creators))
-    phase_cats = [p for p in ["S0", "S1", "S2"] if p in set(phases)]
-    # drop first category for baseline
-    creator_map = {c: i for i, c in enumerate(creator_cats[1:])}
-    phase_map = {p: i for i, p in enumerate(phase_cats[1:])}
+    if "phase" not in df.columns:
+        df["phase"] = df.get("phase_base", "")
+    df["phase"] = df["phase"].astype(str)
+    df["creator_id"] = df.get("creator_id", "").astype(str)
+    df["creator_name"] = df.get("creator_name", "").astype(str)
+    df["creator_group"] = df.get("creator_group", "").astype(str)
+    df["fill_level"] = pd.to_numeric(df.get("fill_level", 0), errors="coerce").fillna(0).astype(int)
+    df["strict_ok"] = pd.to_numeric(df.get("strict_ok", 0), errors="coerce").fillna(0).astype(int)
+    df["subtitle_status"] = df.get("subtitle_status", "").astype(str)
+    df["pubdate_raw"] = df.get("pubdate", df.get("pub_date", "")).astype(str)
+    df["pubdate_dt"] = pd.to_datetime(df["pubdate_raw"], errors="coerce")
+    df = df[df["phase"].isin(["S0", "S1", "S2"])].copy()
+    df = df.dropna(subset=["pubdate_dt"])
 
-    rows = []
-    for c, p in zip(creators, phases, strict=False):
-        row = [1.0]  # intercept
-        # phase dummies
-        for ph in phase_cats[1:]:
-            row.append(1.0 if p == ph else 0.0)
-        # creator dummies
-        for cr in creator_cats[1:]:
-            row.append(1.0 if c == cr else 0.0)
-        rows.append(row)
+    if "length_tokens" in df.columns:
+        df["length_tokens"] = pd.to_numeric(df["length_tokens"], errors="coerce")
+    df["log_length_tokens"] = np.log1p(pd.to_numeric(df.get("length_tokens", 0), errors="coerce").fillna(0.0))
 
-    X = np.array(rows, dtype=float)
-    coef, *_ = np.linalg.lstsq(X, y, rcond=None)
-    y_hat = X @ coef
-    ss_res = np.sum((y - y_hat) ** 2)
-    ss_tot = np.sum((y - y.mean()) ** 2)
-    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    df["time_weeks"] = (df["pubdate_dt"] - df["pubdate_dt"].min()).dt.days.astype(float) / 7.0
+    t1 = pd.Timestamp(cfg.t1)
+    t2 = pd.Timestamp(cfg.t2)
+    df["post_t1"] = (df["pubdate_dt"] >= t1).astype(float)
+    df["post_t2"] = (df["pubdate_dt"] >= t2).astype(float)
+    df["weeks_after_t1"] = ((df["pubdate_dt"] - t1).dt.days.clip(lower=0).astype(float)) / 7.0
+    df["weeks_after_t2"] = ((df["pubdate_dt"] - t2).dt.days.clip(lower=0).astype(float)) / 7.0
 
-    # phase coefficients (relative to baseline phase)
-    phase_coeffs = {}
-    for i, ph in enumerate(phase_cats[1:], start=1):
-        phase_coeffs[ph] = float(coef[i])
+    feature_identifiers = {
+        key_feat,
+        "bvid",
+        "series",
+        "creator_group",
+        "creator_id",
+        "creator_name",
+        "phase",
+        "pubdate",
+        "title",
+        "clean_path",
+        "text",
+    }
+    feature_metric_candidates = [column for column in features.columns if column not in feature_identifiers]
+    numeric_cols: list[str] = []
+    for column in feature_metric_candidates:
+        numeric = pd.to_numeric(df[column], errors="coerce")
+        if int(numeric.notna().sum()) >= 5:
+            df[column] = numeric
+            numeric_cols.append(column)
+    style_metrics = [metric for metric in PRIMARY_STYLE_METRICS if metric in numeric_cols]
 
-    return {"metric": metric, "n": len(y), "r2": float(r2), "phase_coeffs": phase_coeffs}
+    if style_metrics:
+        valid = df[style_metrics].apply(pd.to_numeric, errors="coerce").notna().all(axis=1)
+        if int(valid.sum()) >= 10:
+            values = df.loc[valid, style_metrics].astype(float)
+            means = values.mean(axis=0)
+            stds = values.std(axis=0, ddof=0).replace(0.0, 1.0)
+            z = (values - means) / stds
+            _, _, vt = np.linalg.svd(z.to_numpy(dtype=float), full_matrices=False)
+            pc1 = z.to_numpy(dtype=float) @ vt[0]
+            if "connectives_total" in style_metrics:
+                ref = np.corrcoef(pc1, z["connectives_total"].to_numpy(dtype=float))[0, 1]
+                if np.isfinite(ref) and ref < 0:
+                    pc1 = -pc1
+            df["style_index_pc1"] = np.nan
+            df.loc[valid, "style_index_pc1"] = pc1
+            numeric_cols.append("style_index_pc1")
+            style_metrics.append("style_index_pc1")
+
+    return df, numeric_cols, style_metrics
+
+
+def _creator_pairwise_tests(df: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for metric in metrics:
+        pivot = (
+            df.groupby(["creator_id", "phase"])[metric]
+            .mean()
+            .unstack()
+        )
+        for phase_a, phase_b in PAIRWISE_PHASES:
+            if phase_a not in pivot.columns or phase_b not in pivot.columns:
+                continue
+            subset = pivot[[phase_a, phase_b]].dropna()
+            if len(subset) < 10:
+                continue
+            diff = (subset[phase_b] - subset[phase_a]).to_numpy(dtype=float)
+            if diff.size == 0:
+                continue
+            try:
+                t_res = st.ttest_1samp(diff, popmean=0.0, nan_policy="omit")
+                t_p = float(t_res.pvalue)
+            except Exception:
+                t_p = np.nan
+            try:
+                if np.allclose(diff, diff[0]):
+                    wilcoxon_p = np.nan
+                else:
+                    wilcoxon_p = float(st.wilcoxon(diff).pvalue)
+            except Exception:
+                wilcoxon_p = np.nan
+            ci_low, ci_high = _bootstrap_ci(diff)
+            rows.append(
+                {
+                    "metric": metric,
+                    "pair": f"{phase_a} vs {phase_b}",
+                    "n_creators": int(len(subset)),
+                    "mean_phase_a": float(subset[phase_a].mean()),
+                    "mean_phase_b": float(subset[phase_b].mean()),
+                    "mean_diff": float(np.mean(diff)),
+                    "median_diff": float(np.median(diff)),
+                    "diff_ci_low": ci_low,
+                    "diff_ci_high": ci_high,
+                    "effect_dz": _dz(diff),
+                    "t_p": t_p,
+                    "wilcoxon_p": wilcoxon_p,
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out["t_p_fdr"] = _bh_fdr([float(v) if pd.notna(v) else 1.0 for v in out["t_p"].tolist()])
+    out["wilcoxon_p_fdr"] = _bh_fdr([float(v) if pd.notna(v) else 1.0 for v in out["wilcoxon_p"].tolist()])
+    return out.sort_values(["t_p_fdr", "metric", "pair"]).reset_index(drop=True)
+
+
+def _phase_fe_tests(df: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for metric in metrics:
+        cols = ["creator_id", "phase", metric, "fill_level"]
+        if metric != "length_tokens" and "log_length_tokens" in df.columns:
+            cols.append("log_length_tokens")
+        work = df[cols].copy()
+        work[metric] = pd.to_numeric(work[metric], errors="coerce")
+        work = work.dropna(subset=[metric])
+        if len(work) < 30:
+            continue
+
+        creators = sorted(work["creator_id"].astype(str).unique().tolist())
+        phases = ["S0", "S1", "S2"]
+        param_names = ["intercept", "phase_S1", "phase_S2"]
+        matrix = [
+            np.ones(len(work), dtype=float),
+            (work["phase"] == "S1").astype(float).to_numpy(),
+            (work["phase"] == "S2").astype(float).to_numpy(),
+        ]
+        if metric != "length_tokens" and "log_length_tokens" in work.columns:
+            matrix.append(pd.to_numeric(work["log_length_tokens"], errors="coerce").fillna(0.0).to_numpy(dtype=float))
+            param_names.append("log_length_tokens")
+        matrix.append(pd.to_numeric(work["fill_level"], errors="coerce").fillna(0.0).to_numpy(dtype=float))
+        param_names.append("fill_level")
+
+        for creator in creators[1:]:
+            matrix.append((work["creator_id"] == creator).astype(float).to_numpy())
+            param_names.append(f"creator_{creator}")
+
+        X = np.column_stack(matrix)
+        y = work[metric].to_numpy(dtype=float)
+        clusters = work["creator_id"].to_numpy()
+        result = _ols_cluster_robust(X, y, clusters=clusters, param_names=param_names)
+        if result is None:
+            continue
+
+        for term in ["phase_S1", "phase_S2"]:
+            idx = param_names.index(term)
+            rows.append(
+                {
+                    "metric": metric,
+                    "term": term,
+                    "coef": float(result["coef"][idx]),
+                    "se": float(result["se"][idx]),
+                    "t": float(result["t"][idx]),
+                    "p": float(result["p"][idx]),
+                    "n": int(result["n"]),
+                    "creator_clusters": int(result["clusters"]),
+                    "r2": float(result["r2"]),
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out["p_fdr"] = _bh_fdr(out["p"].tolist())
+    return out.sort_values(["p_fdr", "metric", "term"]).reset_index(drop=True)
+
+
+def _segmented_breakpoint_tests(df: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for metric in metrics:
+        cols = [
+            "creator_id",
+            "time_weeks",
+            "post_t1",
+            "weeks_after_t1",
+            "post_t2",
+            "weeks_after_t2",
+            metric,
+            "fill_level",
+        ]
+        if metric != "length_tokens" and "log_length_tokens" in df.columns:
+            cols.append("log_length_tokens")
+        work = df[cols].copy()
+        work[metric] = pd.to_numeric(work[metric], errors="coerce")
+        work = work.dropna(subset=[metric])
+        if len(work) < 30:
+            continue
+
+        creators = sorted(work["creator_id"].astype(str).unique().tolist())
+        param_names = ["intercept", "time_weeks", "post_t1", "weeks_after_t1", "post_t2", "weeks_after_t2"]
+        matrix = [
+            np.ones(len(work), dtype=float),
+            work["time_weeks"].to_numpy(dtype=float),
+            work["post_t1"].to_numpy(dtype=float),
+            work["weeks_after_t1"].to_numpy(dtype=float),
+            work["post_t2"].to_numpy(dtype=float),
+            work["weeks_after_t2"].to_numpy(dtype=float),
+        ]
+        if metric != "length_tokens" and "log_length_tokens" in work.columns:
+            matrix.append(pd.to_numeric(work["log_length_tokens"], errors="coerce").fillna(0.0).to_numpy(dtype=float))
+            param_names.append("log_length_tokens")
+        matrix.append(pd.to_numeric(work["fill_level"], errors="coerce").fillna(0.0).to_numpy(dtype=float))
+        param_names.append("fill_level")
+
+        for creator in creators[1:]:
+            matrix.append((work["creator_id"] == creator).astype(float).to_numpy())
+            param_names.append(f"creator_{creator}")
+
+        X = np.column_stack(matrix)
+        y = work[metric].to_numpy(dtype=float)
+        clusters = work["creator_id"].to_numpy()
+        result = _ols_cluster_robust(X, y, clusters=clusters, param_names=param_names)
+        if result is None:
+            continue
+
+        for term in ["post_t1", "weeks_after_t1", "post_t2", "weeks_after_t2"]:
+            idx = param_names.index(term)
+            rows.append(
+                {
+                    "metric": metric,
+                    "term": term,
+                    "coef": float(result["coef"][idx]),
+                    "se": float(result["se"][idx]),
+                    "t": float(result["t"][idx]),
+                    "p": float(result["p"][idx]),
+                    "n": int(result["n"]),
+                    "creator_clusters": int(result["clusters"]),
+                    "r2": float(result["r2"]),
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out["p_fdr"] = _bh_fdr(out["p"].tolist())
+    return out.sort_values(["p_fdr", "metric", "term"]).reset_index(drop=True)
+
+
+def _phase_stats(df: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for metric in metrics:
+        for phase in ["S0", "S1", "S2"]:
+            subset = pd.to_numeric(df.loc[df["phase"] == phase, metric], errors="coerce").dropna()
+            if subset.empty:
+                continue
+            rows.append(
+                {
+                    "phase": phase,
+                    "metric": metric,
+                    "n": int(subset.shape[0]),
+                    "mean": float(subset.mean()),
+                    "median": float(subset.median()),
+                    "std": float(subset.std(ddof=1) if subset.shape[0] > 1 else 0.0),
+                    "min": float(subset.min()),
+                    "max": float(subset.max()),
+                    "iqr": float(subset.quantile(0.75) - subset.quantile(0.25)),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _plot_boxplot(df: pd.DataFrame, *, metric: str, out_path: Path, title: str) -> None:
+    tmp = df.copy()
+    tmp[metric] = pd.to_numeric(tmp[metric], errors="coerce")
+    tmp = tmp.dropna(subset=[metric])
+    if tmp.empty:
+        return
+    order = ["S0", "S1", "S2"]
+    data = [tmp.loc[tmp["phase"] == phase, metric].tolist() for phase in order]
+    fig, ax = plt.subplots(figsize=(6.4, 4.0), dpi=150)
+    ax.boxplot(data, tick_labels=order, showmeans=True)
+    ax.set_title(title)
+    ax.set_xlabel("Phase")
+    ax.set_ylabel(metric)
+    ax.grid(True, axis="y", linestyle="--", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def _plot_time_trend(df: pd.DataFrame, *, metric: str, out_path: Path, title: str, t1: pd.Timestamp, t2: pd.Timestamp) -> None:
+    tmp = df[["pubdate_dt", metric]].copy()
+    tmp[metric] = pd.to_numeric(tmp[metric], errors="coerce")
+    tmp = tmp.dropna(subset=[metric, "pubdate_dt"])
+    if tmp.empty:
+        return
+    tmp["month"] = tmp["pubdate_dt"].dt.to_period("M").dt.to_timestamp()
+    grouped = tmp.groupby("month")[metric].mean().reset_index()
+    if grouped.empty:
+        return
+    grouped["rolling_3m"] = grouped[metric].rolling(window=3, min_periods=1).mean()
+    fig, ax = plt.subplots(figsize=(7.0, 4.0), dpi=150)
+    ax.plot(grouped["month"], grouped[metric], color="#9ecae1", linewidth=1.0, alpha=0.8, label="monthly mean")
+    ax.plot(grouped["month"], grouped["rolling_3m"], color="#08519c", linewidth=2.0, label="3-month rolling mean")
+    ax.axvline(t1, color="#ef3b2c", linestyle="--", linewidth=1.2, label="T1")
+    ax.axvline(t2, color="#31a354", linestyle="--", linewidth=1.2, label="T2")
+    ax.set_title(title)
+    ax.set_xlabel("Month")
+    ax.set_ylabel(metric)
+    ax.grid(True, axis="y", linestyle="--", alpha=0.3)
+    ax.legend(frameon=False, ncol=2)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def _creator_coverage_table(df: pd.DataFrame) -> pd.DataFrame:
+    coverage = (
+        df.groupby(["creator_id", "phase"])
+        .size()
+        .unstack(fill_value=0)
+        .reset_index()
+    )
+    for phase in ["S0", "S1", "S2"]:
+        if phase not in coverage.columns:
+            coverage[phase] = 0
+    coverage["has_all_phases"] = ((coverage["S0"] > 0) & (coverage["S1"] > 0) & (coverage["S2"] > 0)).astype(int)
+    coverage["full_10x3"] = ((coverage["S0"] >= 10) & (coverage["S1"] >= 10) & (coverage["S2"] >= 10)).astype(int)
+    return coverage.sort_values(["has_all_phases", "full_10x3", "creator_id"], ascending=[False, False, True]).reset_index(drop=True)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Full analysis package for #011")
+    parser = argparse.ArgumentParser(description="Full breakpoint analysis with creator-level and segmented models")
     parser.add_argument("--features", default="outputs/features.csv", help="features.csv path")
     parser.add_argument("--manifest", default="outputs/final_manifest.csv", help="final_manifest.csv path")
+    parser.add_argument("--breakpoints", default="config/breakpoints.yaml", help="breakpoints yaml path")
     parser.add_argument("--out-dir", default="", help="output dir (default runs/<run_id>/outputs)")
     parser.add_argument("--run-id", default="", help="run id for archiving under runs/<run_id>")
-    parser.add_argument("--min-n-per-phase", type=int, default=50, help="minimum samples per phase to run inference")
-    parser.add_argument("--min-creators", type=int, default=20, help="minimum creators to run inference")
-    parser.add_argument("--quick-summary-only", action="store_true", help="only output descriptive stats")
+    parser.add_argument("--min-n", type=int, default=30, help="minimum rows per metric model")
     args = parser.parse_args()
 
     paths = get_project_paths()
@@ -176,325 +533,164 @@ def main() -> int:
 
     features_path = (paths.root / args.features).resolve()
     manifest_path = (paths.root / args.manifest).resolve()
+    breakpoints_path = (paths.root / args.breakpoints).resolve()
+    cfg = load_breakpoints_yaml(breakpoints_path)
+
     features = pd.read_csv(features_path, dtype=str).fillna("")
     manifest = pd.read_csv(manifest_path, dtype=str).fillna("")
+    df, numeric_metrics, style_metrics = _prepare_dataset(features, manifest, cfg)
+    if df.empty:
+        raise ValueError("No analyzable rows after merging features and manifest")
 
-    # Merge
-    key_feat = "video_id" if "video_id" in features.columns else "bvid"
-    key_man = "unique_key" if "unique_key" in manifest.columns else "bvid"
-    merge_cols = [key_man, "creator_id", "phase_base", "pubdate", "strict_ok", "fill_level", "fill_reason", "creator_group"]
-    merge_cols = [c for c in merge_cols if c in manifest.columns]
-    df = features.merge(
-        manifest[merge_cols],
-        how="left",
-        left_on=key_feat,
-        right_on=key_man,
-        suffixes=("", "_m"),
+    if args.min_n > 0:
+        numeric_metrics = [
+            metric
+            for metric in numeric_metrics
+            if int(pd.to_numeric(df[metric], errors="coerce").notna().sum()) >= int(args.min_n)
+        ]
+
+    phase_counts = df["phase"].value_counts().reindex(["S0", "S1", "S2"]).fillna(0).astype(int)
+    phase_counts.rename_axis("phase").reset_index(name="count").to_csv(
+        tables_dir / "phase_counts.csv", index=False, encoding="utf-8-sig"
     )
-    if "phase" not in df.columns:
-        df["phase"] = df.get("phase_base", "")
-    df["phase"] = df["phase"].astype(str)
-    df["creator_id"] = df.get("creator_id", df.get("creator_group", "")).astype(str)
 
-    # Numeric metrics
-    metric_cols = [c for c in df.columns if c not in {key_feat, "series", "creator_group", "phase", "creator_id"}]
-    metric_cols = [c for c in metric_cols if c in features.columns]
-    numeric_cols = []
-    for c in metric_cols:
-        s = pd.to_numeric(df[c], errors="coerce")
-        if s.notna().sum() >= 5:
-            df[c] = s
-            numeric_cols.append(c)
+    fill_counts = df["fill_level"].value_counts().sort_index()
+    fill_counts.rename_axis("fill_level").reset_index(name="count").to_csv(
+        tables_dir / "fill_level_counts.csv", index=False, encoding="utf-8-sig"
+    )
 
-    phases = [p for p in ["S0", "S1", "S2"] if p in df["phase"].unique().tolist()]
-    df_phase = df[df["phase"].isin(phases)].copy()
-
-    # Phase counts
-    phase_counts = df_phase["phase"].value_counts().reindex(phases).fillna(0).astype(int)
-    phase_counts.to_csv(tables_dir / "phase_counts.csv", encoding="utf-8-sig")
-
-    # Fill level distribution
-    if "fill_level" in df_phase.columns:
-        fill_counts = df_phase["fill_level"].value_counts().sort_index()
-        fill_counts.to_csv(tables_dir / "fill_level_counts.csv", encoding="utf-8-sig")
-
-    creator_count = df_phase["creator_id"].nunique() if "creator_id" in df_phase.columns else 0
     sample_structure = (
-        df_phase.groupby("phase")
+        df.groupby("phase")
         .agg(n=("phase", "count"), creators=("creator_id", "nunique"))
         .reset_index()
     )
     sample_structure.to_csv(tables_dir / "sample_structure.csv", index=False, encoding="utf-8-sig")
 
-    # quick summary only / insufficient sample
-    insufficient = args.quick_summary_only
-    if not insufficient:
-        if len(phases) < 2:
-            insufficient = True
-        elif (phase_counts.min() if len(phase_counts) else 0) < int(args.min_n_per_phase):
-            insufficient = True
-        elif creator_count < int(args.min_creators):
-            insufficient = True
+    coverage = _creator_coverage_table(df)
+    coverage.to_csv(tables_dir / "creator_phase_coverage.csv", index=False, encoding="utf-8-sig")
 
-    if insufficient:
-        # descriptive stats by phase
-        desc_rows = []
-        for metric in numeric_cols:
-            for p in phases:
-                vals = pd.to_numeric(
-                    df_phase.loc[df_phase["phase"] == p, metric], errors="coerce"
-                ).dropna()
-                if vals.empty:
-                    continue
-                desc_rows.append(
-                    {
-                        "phase": p,
-                        "metric": metric,
-                        "n": int(vals.shape[0]),
-                        "mean": float(vals.mean()),
-                        "median": float(vals.median()),
-                        "std": float(vals.std(ddof=1) if vals.shape[0] > 1 else 0.0),
-                        "min": float(vals.min()),
-                        "max": float(vals.max()),
-                        "iqr": float(vals.quantile(0.75) - vals.quantile(0.25)),
-                    }
-                )
-        pd.DataFrame(desc_rows).to_csv(tables_dir / "phase_stats.csv", index=False, encoding="utf-8-sig")
+    phase_stats = _phase_stats(df, numeric_metrics)
+    phase_stats.to_csv(tables_dir / "phase_stats.csv", index=False, encoding="utf-8-sig")
 
-        # fig01: phase counts
-        import matplotlib.pyplot as plt
+    pairwise_df = _creator_pairwise_tests(df, numeric_metrics)
+    if not pairwise_df.empty:
+        pairwise_df.to_csv(tables_dir / "creator_phase_tests.csv", index=False, encoding="utf-8-sig")
 
-        fig1 = plt.figure(figsize=(6.0, 4.0), dpi=150)
-        ax = fig1.add_subplot(111)
-        ax.bar(phase_counts.index.tolist(), phase_counts.values.tolist(), color=["#1f77b4", "#ff7f0e", "#2ca02c"])
-        ax.set_title("Phase counts")
-        ax.set_xlabel("Phase")
-        ax.set_ylabel("Count")
-        ax.grid(True, axis="y", linestyle="--", alpha=0.3)
-        fig1.tight_layout()
-        fig1.savefig(plots_dir / "fig01_phase_counts.png")
-        plt.close(fig1)
+    phase_fe_df = _phase_fe_tests(df, numeric_metrics)
+    if not phase_fe_df.empty:
+        phase_fe_df.to_csv(tables_dir / "creator_fe_phase.csv", index=False, encoding="utf-8-sig")
 
-        report_lines = [
-            f"# Analysis Report ({run_id})",
-            "",
-            "## INSUFFICIENT SAMPLE FOR INFERENCE",
-            f"- min_n_per_phase: {args.min_n_per_phase}",
-            f"- min_creators: {args.min_creators}",
-            f"- phases: {', '.join(phases)}",
-            f"- phase_counts: {phase_counts.to_dict()}",
-            f"- creators: {creator_count}",
-            "",
-            f"- features_path: {features_path}",
-            f"- manifest_path: {manifest_path}",
-            f"- samples: {len(df_phase)}",
-            f"- numeric_metrics: {', '.join(numeric_cols)}",
-            "",
-            "## Outputs",
-            f"- tables: {tables_dir}",
-            f"- plots: {plots_dir}",
-        ]
-        report_path = out_dir / "analysis_report.md"
-        report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
-        (out_dir / "analysis_log.txt").write_text("\n".join(log_lines) + "\n", encoding="utf-8")
-        return 0
+    segmented_df = _segmented_breakpoint_tests(df, numeric_metrics)
+    if not segmented_df.empty:
+        segmented_df.to_csv(tables_dir / "segmented_breakpoints.csv", index=False, encoding="utf-8-sig")
 
-    # ANOVA / Welch / Kruskal
-    import scipy.stats as st  # type: ignore
-
-    anova_rows = []
-    pair_rows = []
-    for metric in numeric_cols:
-        groups = [df_phase.loc[df_phase["phase"] == p, metric].dropna().to_numpy(dtype=float) for p in phases]
-        if len(groups) < 2:
-            continue
-        if min(len(g) for g in groups) < 3:
-            continue
-        f_stat, p_val = st.f_oneway(*groups)
-        welch_f, df1, df2, welch_p = _welch_anova(groups)
-        kruskal = st.kruskal(*groups)
-        anova_rows.append(
-            {
-                "metric": metric,
-                "anova_f": float(f_stat),
-                "anova_p": float(p_val),
-                "welch_f": float(welch_f),
-                "welch_df1": float(df1),
-                "welch_df2": float(df2),
-                "welch_p": float(welch_p),
-                "kruskal_h": float(kruskal.statistic),
-                "kruskal_p": float(kruskal.pvalue),
-            }
-        )
-
-        # pairwise
-        phase_pairs = [("S0", "S1"), ("S0", "S2"), ("S1", "S2")]
-        for a, b in phase_pairs:
-            if a not in phases or b not in phases:
-                continue
-            ga = df_phase.loc[df_phase["phase"] == a, metric].dropna().to_numpy(dtype=float)
-            gb = df_phase.loc[df_phase["phase"] == b, metric].dropna().to_numpy(dtype=float)
-            if len(ga) < 3 or len(gb) < 3:
-                continue
-            t = st.ttest_ind(ga, gb, equal_var=False)
-            mw = st.mannwhitneyu(ga, gb, alternative="two-sided")
-            d = _cohens_d(ga, gb)
-            ci_lo, ci_hi = _bootstrap_ci(ga, gb, n=300)
-            pair_rows.append(
-                {
-                    "metric": metric,
-                    "pair": f"{a} vs {b}",
-                    "t_p": float(t.pvalue),
-                    "mw_p": float(mw.pvalue),
-                    "cohens_d": float(d),
-                    "d_ci_low": ci_lo,
-                    "d_ci_high": ci_hi,
-                }
-            )
-
-    anova_df = pd.DataFrame(anova_rows)
-    if not anova_df.empty:
-        anova_df["anova_p_fdr"] = _bh_fdr(anova_df["anova_p"].tolist())
-        anova_df["welch_p_fdr"] = _bh_fdr(anova_df["welch_p"].tolist())
-        anova_df["kruskal_p_fdr"] = _bh_fdr(anova_df["kruskal_p"].tolist())
-        anova_df.to_csv(tables_dir / "anova_summary.csv", index=False, encoding="utf-8-sig")
-
-    pair_df = pd.DataFrame(pair_rows)
-    if not pair_df.empty:
-        pair_df["t_p_fdr"] = _bh_fdr(pair_df["t_p"].tolist())
-        pair_df["mw_p_fdr"] = _bh_fdr(pair_df["mw_p"].tolist())
-        pair_df.to_csv(tables_dir / "pairwise_tests.csv", index=False, encoding="utf-8-sig")
-
-    # Fixed effects
-    fe_rows = []
-    for metric in numeric_cols:
-        fe = _fixed_effects(df_phase, metric)
-        fe_rows.append(fe)
-    if fe_rows:
-        fe_df = pd.DataFrame(
-            [
-                {
-                    "metric": r.get("metric"),
-                    "n": r.get("n"),
-                    "r2": r.get("r2"),
-                    "phase_coeffs": json.dumps(r.get("phase_coeffs", {}), ensure_ascii=False),
-                }
-                for r in fe_rows
-            ]
-        )
-        fe_df.to_csv(tables_dir / "fixed_effects.csv", index=False, encoding="utf-8-sig")
-
-    # Spearman correlation
-    if numeric_cols:
-        corr = df_phase[numeric_cols].corr(method="spearman")
+    corr_cols = [metric for metric in numeric_metrics if metric in df.columns]
+    if corr_cols:
+        corr = df[corr_cols].corr(method="spearman")
         corr.to_csv(tables_dir / "spearman_corr.csv", encoding="utf-8-sig")
 
-        # VIF
-        vif_df = _vif(df_phase.dropna(subset=numeric_cols), numeric_cols)
-        vif_df.to_csv(tables_dir / "vif.csv", index=False, encoding="utf-8-sig")
-
-        # PCA
-        try:
-            from sklearn.decomposition import PCA  # type: ignore
-            from sklearn.preprocessing import StandardScaler  # type: ignore
-
-            X = df_phase[numeric_cols].fillna(0.0).to_numpy(dtype=float)
-            Xs = StandardScaler().fit_transform(X)
-            pca = PCA(n_components=min(5, Xs.shape[1]))
-            comps = pca.fit_transform(Xs)
-            pca_df = pd.DataFrame(comps, columns=[f"PC{i+1}" for i in range(comps.shape[1])])
-            pca_df["phase"] = df_phase["phase"].values
-            pca_df.to_csv(tables_dir / "pca_scores.csv", index=False, encoding="utf-8-sig")
-            pd.DataFrame(
-                {"component": [f"PC{i+1}" for i in range(len(pca.explained_variance_ratio_))],
-                 "explained_variance_ratio": pca.explained_variance_ratio_}
-            ).to_csv(tables_dir / "pca_variance.csv", index=False, encoding="utf-8-sig")
-        except Exception:
-            pass
-
-    # Plots
-    import matplotlib.pyplot as plt
-
-    # fig01: phase counts
-    fig1 = plt.figure(figsize=(6.0, 4.0), dpi=150)
-    ax = fig1.add_subplot(111)
+    fig_phase_counts = plt.figure(figsize=(6.0, 4.0), dpi=150)
+    ax = fig_phase_counts.add_subplot(111)
     ax.bar(phase_counts.index.tolist(), phase_counts.values.tolist(), color=["#1f77b4", "#ff7f0e", "#2ca02c"])
     ax.set_title("Phase counts")
     ax.set_xlabel("Phase")
     ax.set_ylabel("Count")
     ax.grid(True, axis="y", linestyle="--", alpha=0.3)
-    fig1.tight_layout()
-    fig1.savefig(plots_dir / "fig01_phase_counts.png")
-    plt.close(fig1)
+    fig_phase_counts.tight_layout()
+    fig_phase_counts.savefig(plots_dir / "fig01_phase_counts.png")
+    plt.close(fig_phase_counts)
 
-    # fig02-04: boxplots for key metrics
-    for idx, metric in enumerate([c for c in ["mattr", "mean_sent_len_chars", "connectives_total"] if c in df_phase.columns], start=2):
-        data = [df_phase.loc[df_phase["phase"] == p, metric].dropna().tolist() for p in phases]
-        fig = plt.figure(figsize=(6.4, 4.0), dpi=150)
-        ax = fig.add_subplot(111)
-        ax.boxplot(data, tick_labels=phases, showmeans=True)
-        ax.set_title(f"{metric} by phase")
-        ax.set_xlabel("Phase")
-        ax.set_ylabel(metric)
-        ax.grid(True, axis="y", linestyle="--", alpha=0.3)
-        fig.tight_layout()
-        fig.savefig(plots_dir / f"fig0{idx}_{metric}_box.png")
-        plt.close(fig)
+    for idx, metric in enumerate([m for m in ["mattr", "connectives_total", "mean_sent_len_chars", "style_index_pc1"] if m in df.columns], start=2):
+        _plot_boxplot(
+            df,
+            metric=metric,
+            out_path=plots_dir / f"fig0{idx}_{metric}_box.png",
+            title=f"{metric} by phase",
+        )
 
-    # fig05: time trend (monthly)
-    if "pubdate" in df_phase.columns:
-        tmp = df_phase.copy()
-        tmp["pubdate"] = pd.to_datetime(tmp["pubdate"], errors="coerce")
-        tmp = tmp.dropna(subset=["pubdate"])
-        if not tmp.empty and "mattr" in tmp.columns:
-            tmp["month"] = tmp["pubdate"].dt.to_period("M").dt.to_timestamp()
-            grp = tmp.groupby("month")["mattr"].mean().reset_index()
-            fig = plt.figure(figsize=(6.8, 4.0), dpi=150)
-            ax = fig.add_subplot(111)
-            ax.plot(grp["month"], grp["mattr"], marker="o", linewidth=1.5)
-            ax.set_title("MATTR time trend (monthly)")
-            ax.set_xlabel("Month")
-            ax.set_ylabel("MATTR")
-            ax.grid(True, axis="y", linestyle="--", alpha=0.3)
-            fig.autofmt_xdate()
-            fig.tight_layout()
-            fig.savefig(plots_dir / "fig05_mattr_time_trend.png")
-            plt.close(fig)
+    t1 = pd.Timestamp(cfg.t1)
+    t2 = pd.Timestamp(cfg.t2)
+    if "mattr" in df.columns:
+        _plot_time_trend(
+            df,
+            metric="mattr",
+            out_path=plots_dir / "fig06_mattr_time_trend.png",
+            title="MATTR monthly trend with breakpoints",
+            t1=t1,
+            t2=t2,
+        )
+    if "style_index_pc1" in df.columns:
+        _plot_time_trend(
+            df,
+            metric="style_index_pc1",
+            out_path=plots_dir / "fig07_style_index_time_trend.png",
+            title="Style index monthly trend with breakpoints",
+            t1=t1,
+            t2=t2,
+        )
 
-    # Report
-    sig_anova = 0
-    sig_pair = 0
-    effect_range = ""
-    if not anova_df.empty:
-        sig_anova = int((anova_df["anova_p_fdr"] < 0.05).sum())
-    if not pair_df.empty:
-        sig_pair = int((pair_df["t_p_fdr"] < 0.05).sum())
-        if sig_pair > 0:
-            d_vals = pair_df.loc[pair_df["t_p_fdr"] < 0.05, "cohens_d"].tolist()
-            effect_range = f"{min(d_vals):.3f} ~ {max(d_vals):.3f}" if d_vals else ""
+    phase_sig_metrics = 0
+    if not phase_fe_df.empty:
+        phase_sig_metrics = int(phase_fe_df.loc[phase_fe_df["p_fdr"] < 0.05, "metric"].nunique())
+    segmented_sig_metrics = 0
+    if not segmented_df.empty:
+        segmented_sig_metrics = int(segmented_df.loc[segmented_df["p_fdr"] < 0.05, "metric"].nunique())
+    pair_sig = 0
+    if not pairwise_df.empty:
+        pair_sig = int((pairwise_df["t_p_fdr"] < 0.05).sum())
+
+    top_lines: list[str] = []
+    if not phase_fe_df.empty:
+        for _, row in phase_fe_df.head(5).iterrows():
+            top_lines.append(
+                f"- FE phase: {row['metric']} / {row['term']} coef={row['coef']:.4f}, p_fdr={row['p_fdr']:.4g}"
+            )
+    if not segmented_df.empty:
+        for _, row in segmented_df.head(5).iterrows():
+            top_lines.append(
+                f"- Breakpoint: {row['metric']} / {row['term']} coef={row['coef']:.4f}, p_fdr={row['p_fdr']:.4g}"
+            )
+    if not pairwise_df.empty:
+        for _, row in pairwise_df.head(5).iterrows():
+            top_lines.append(
+                f"- Creator paired: {row['metric']} / {row['pair']} mean_diff={row['mean_diff']:.4f}, p_fdr={row['t_p_fdr']:.4g}"
+            )
 
     report_lines = [
         f"# Analysis Report ({run_id})",
         "",
         f"- features_path: {features_path}",
         f"- manifest_path: {manifest_path}",
-        f"- samples: {len(df_phase)}",
-        f"- phases: {', '.join(phases)}",
-        f"- numeric_metrics: {', '.join(numeric_cols)}",
+        f"- breakpoints_path: {breakpoints_path}",
+        f"- breakpoints: T1={cfg.t1.isoformat()}, T2={cfg.t2.isoformat()}",
+        f"- samples_ok: {len(df)}",
+        f"- creators: {df['creator_id'].nunique()}",
+        f"- creators_with_all_phases: {int(coverage['has_all_phases'].sum())}",
+        f"- creators_with_10x3_ok: {int(coverage['full_10x3'].sum())}",
+        f"- numeric_metrics: {', '.join(numeric_metrics)}",
         "",
-        "## Key Results (FDR-controlled)",
-        f"- ANOVA significant metrics (FDR<0.05): {sig_anova}",
-        f"- Pairwise significant comparisons (FDR<0.05): {sig_pair}",
-        f"- Effect size range (Cohen's d, significant pairs): {effect_range or 'n/a'}",
+        "## Methods",
+        "- Creator-level paired comparisons on creator mean values across phases.",
+        "- Creator fixed-effects panel models with cluster-robust standard errors.",
+        "- Segmented breakpoint regressions around T1 and T2, with creator fixed effects and length/fill controls.",
         "",
-        "## Outputs",
-        f"- tables: {tables_dir}",
-        f"- plots: {plots_dir}",
+        "## Key Results",
+        f"- Creator FE significant metrics (FDR<0.05): {phase_sig_metrics}",
+        f"- Segmented breakpoint significant metrics (FDR<0.05): {segmented_sig_metrics}",
+        f"- Creator paired significant comparisons (FDR<0.05): {pair_sig}",
     ]
-    report_path = out_dir / "analysis_report.md"
-    report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
-
-    # Log
+    if top_lines:
+        report_lines.extend(["", "## Top Findings"])
+        report_lines.extend(top_lines)
+    report_lines.extend(
+        [
+            "",
+            "## Outputs",
+            f"- tables: {tables_dir}",
+            f"- plots: {plots_dir}",
+        ]
+    )
+    (out_dir / "analysis_report.md").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
     (out_dir / "analysis_log.txt").write_text("\n".join(log_lines) + "\n", encoding="utf-8")
     return 0
 
